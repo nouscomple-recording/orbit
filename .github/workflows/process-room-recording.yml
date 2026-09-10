@@ -285,6 +285,18 @@ jobs:
 
           FILTER_COMPLEX=$(IFS=';'; echo "${FILTER_PARTS[*]}")
 
+          # -map needs a bare input stream reference (e.g. "3:a") for a
+          # literal source, but a filtergraph OUTPUT PAD (e.g. "outa", from
+          # the amix filter above) must be wrapped in brackets ("[outa]") or
+          # ffmpeg rejects it ("Invalid stream specifier: outa"). Since
+          # FINAL_AUDIO_LABEL is only ever "N:a" (0/1 audio tracks) or
+          # "outa" (2+, mixed), a simple regex picks the right form.
+          if [[ "$FINAL_AUDIO_LABEL" =~ ^[0-9]+:a$ ]]; then
+            AUDIO_MAP_ARG="$FINAL_AUDIO_LABEL"
+          else
+            AUDIO_MAP_ARG="[$FINAL_AUDIO_LABEL]"
+          fi
+
           OUT_MP4="${WORKDIR}/${ROOM_ID}.mp4"
           log "running ffmpeg..."
           log "filter_complex: $FILTER_COMPLEX"
@@ -293,7 +305,7 @@ jobs:
             ffmpeg -y -hide_banner -loglevel warning \
               "${FFMPEG_INPUTS[@]}" \
               -filter_complex "$FILTER_COMPLEX" \
-              -map "[${FINAL_VIDEO_LABEL}]" -map "${FINAL_AUDIO_LABEL}" \
+              -map "[${FINAL_VIDEO_LABEL}]" -map "$AUDIO_MAP_ARG" \
               -c:v libx264 -preset veryfast -crf 28 -pix_fmt yuv420p \
               -c:a aac -b:a 128k \
               -t "$TOTAL_DURATION" -movflags +faststart \
@@ -301,7 +313,7 @@ jobs:
           else
             ffmpeg -y -hide_banner -loglevel warning \
               "${FFMPEG_INPUTS[@]}" \
-              -map "0:v" -map "${FINAL_AUDIO_LABEL}" \
+              -map "0:v" -map "$AUDIO_MAP_ARG" \
               -c:v libx264 -preset veryfast -crf 28 -pix_fmt yuv420p \
               -c:a aac -b:a 128k \
               -t "$TOTAL_DURATION" -movflags +faststart \

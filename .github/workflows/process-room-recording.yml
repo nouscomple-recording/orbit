@@ -44,10 +44,10 @@ jobs:
           : "${RECORDER_HOOK_SECRET:?missing secret RECORDER_HOOK_SECRET}"
           echo "Processing room: $ROOM_ID"
 
-      - name: Install rclone and bc (ffmpeg/jq/curl/openssl/python3 already on runner)
+      - name: Install ffmpeg, rclone, bc (jq/curl/openssl/python3 already on runner)
         run: |
           sudo apt-get update -y
-          sudo apt-get install -y bc
+          sudo apt-get install -y ffmpeg bc
           curl https://rclone.org/install.sh | sudo bash
           for bin in ffmpeg ffprobe rclone jq curl openssl python3 bc; do
             command -v "$bin" >/dev/null 2>&1 || { echo "::error::missing tool: $bin"; exit 1; }
@@ -322,42 +322,4 @@ jobs:
 
           log "uploading compressed MP4 -> r2://${R2_BUCKET_NAME}/${R2_KEY}"
           if ! rclone_ copyto "$OUT_MP4" "${RCLONE_REMOTE}:${R2_BUCKET_NAME}/${R2_KEY}"; then
-            fail "upload of compressed MP4 to R2 failed - nothing deleted."
-          fi
-
-          REMOTE_SIZE=$(rclone_ size "${RCLONE_REMOTE}:${R2_BUCKET_NAME}/${R2_KEY}" --json 2>/dev/null | jq -r '.bytes // 0')
-          if [[ "$REMOTE_SIZE" != "$LOCAL_SIZE" ]]; then
-            fail "uploaded file size mismatch (local=$LOCAL_SIZE, r2=$REMOTE_SIZE) - nothing deleted."
-          fi
-          log "upload verified: $REMOTE_SIZE bytes in R2 match local file"
-
-          RECORDING_ID=$(python3 -c "import uuid;print(uuid.uuid4())")
-          REGISTER_PAYLOAD=$(jq -n \
-            --arg room_id "$ROOM_ID" \
-            --arg recording_id "$RECORDING_ID" \
-            --arg file_name "$FILE_NAME" \
-            --arg r2_key "$R2_KEY" \
-            --argjson file_size_bytes "$LOCAL_SIZE" \
-            '{room_id: $room_id, recording_id: $recording_id, file_name: $file_name, r2_key: $r2_key, file_size_bytes: $file_size_bytes}')
-
-          log "registering recording with Supabase..."
-          REGISTER_RESPONSE=$(curl -sS -X POST "${SUPABASE_URL}/functions/v1/register-recording" \
-            -H "Content-Type: application/json" \
-            -H "x-hook-secret: ${RECORDER_HOOK_SECRET}" \
-            -d "$REGISTER_PAYLOAD")
-
-          if ! jq -e '.ok == true' <<<"$REGISTER_RESPONSE" >/dev/null 2>&1; then
-            fail "register-recording call failed: $REGISTER_RESPONSE - MP4 IS safely in R2 at ${R2_KEY}, nothing deleted."
-          fi
-          log "registered OK: $REGISTER_RESPONSE"
-
-          log "cleaning up: deleting raw per-track R2 objects..."
-          for key in "${RAW_KEYS[@]}"; do
-            rclone_ deletefile "${RCLONE_REMOTE}:${R2_BUCKET_NAME}/${key}" || true
-          done
-
-          log "==== done: room $ROOM_ID -> r2://${R2_BUCKET_NAME}/${R2_KEY} ===="
-
-      - name: Clean up workdir
-        if: always()
-        run: rm -rf "${RUNNER_TEMP:?}"/orbit-*_* 2>/dev/null || true
+            fail "upload of compressed MP4 to R2 failed - nothing

@@ -1,0 +1,363 @@
+name: Process Room Recording
+
+on:
+  repository_dispatch:
+    types: [process_room]
+  workflow_dispatch:
+    inputs:
+      room_id:
+        description: 'PlugNmeet room_id to process (e.g. orbit-<schedule-id>)'
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  process:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      ROOM_ID: ${{ github.event.client_payload.room_id || github.event.inputs.room_id }}
+      R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+      R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
+      LIVEKIT_API_KEY: ${{ secrets.LIVEKIT_API_KEY }}
+      LIVEKIT_API_SECRET: ${{ secrets.LIVEKIT_API_SECRET }}
+      LIVEKIT_HOST: ${{ secrets.LIVEKIT_HOST }}
+      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+      RECORDER_HOOK_SECRET: ${{ secrets.RECORDER_HOOK_SECRET }}
+    steps:
+      - name: Validate inputs
+        run: |
+          if [[ -z "${ROOM_ID:-}" ]]; then
+            echo "::error::No room_id provided (repository_dispatch client_payload.room_id or workflow_dispatch input.room_id)"
+            exit 1
+          fi
+          : "${R2_ACCOUNT_ID:?missing secret R2_ACCOUNT_ID}"
+          : "${R2_ACCESS_KEY_ID:?missing secret R2_ACCESS_KEY_ID}"
+          : "${R2_SECRET_ACCESS_KEY:?missing secret R2_SECRET_ACCESS_KEY}"
+          : "${R2_BUCKET_NAME:?missing secret R2_BUCKET_NAME}"
+          : "${LIVEKIT_API_KEY:?missing secret LIVEKIT_API_KEY}"
+          : "${LIVEKIT_API_SECRET:?missing secret LIVEKIT_API_SECRET}"
+          : "${SUPABASE_URL:?missing secret SUPABASE_URL}"
+          : "${RECORDER_HOOK_SECRET:?missing secret RECORDER_HOOK_SECRET}"
+          echo "Processing room: $ROOM_ID"
+
+      - name: Install rclone and bc (ffmpeg/jq/curl/openssl/python3 already on runner)
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y bc
+          curl https://rclone.org/install.sh | sudo bash
+          for bin in ffmpeg ffprobe rclone jq curl openssl python3 bc; do
+            command -v "$bin" >/dev/null 2>&1 || { echo "::error::missing tool: $bin"; exit 1; }
+          done
+
+      # Deliberately -uo pipefail, NOT -e (matches process_room.sh's own
+      # `set -u; set -o pipefail` exactly) - several steps below capture a
+      # command's exit code into $rc on the line AFTER running it (e.g. the
+      # rclone download loop), which only works if a non-zero exit doesn't
+      # abort the shell immediately the way GitHub Actions' *default* bash
+      # invocation (`bash --noprofile --norc -eo pipefail`) would.
+      - name: Composite, compress, upload, register, clean up
+        shell: bash --noprofile --norc -uo pipefail {0}
+        run: |
+          LIVEKIT_HOST="${LIVEKIT_HOST:-https://meet.nouscomplex.com/livekit}"
+          LIVEKIT_HOST="${LIVEKIT_HOST%/}"
+
+          log() { echo "[$(date -u +%H:%M:%S)] $*"; }
+          fail() { log "FATAL: $*"; exit 1; }
+
+          log "==== processing room: $ROOM_ID ===="
+
+          WORKDIR="${RUNNER_TEMP}/${ROOM_ID}_$(date -u +%s)"
+          mkdir -p "$WORKDIR"
+          log "workdir: $WORKDIR"
+
+          RCLONE_REMOTE="nouscomplex_r2_pipeline"
+          RCLONE_CONF="${WORKDIR}/rclone.conf"
+          cat > "$RCLONE_CONF" <<EOF
+          [$RCLONE_REMOTE]
+          type = s3
+          provider = Cloudflare
+          access_key_id = $R2_ACCESS_KEY_ID
+          secret_access_key = $R2_SECRET_ACCESS_KEY
+          endpoint = https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com
+          no_check_bucket = true
+          no_head = true
+          acl =
+          EOF
+          chmod 600 "$RCLONE_CONF"
+          rclone_() { rclone --config "$RCLONE_CONF" "$@"; }
+
+          # ---- LiveKit Egress API (over the public endpoint - this runner
+          # has no access to the Oracle box's localhost) ----
+          livekit_jwt() {
+            local now exp header_b64 payload_b64 signing_input sig_b64
+            now=$(date +%s)
+            exp=$((now + 600))
+            header_b64=$(printf '{"alg":"HS256","typ":"JWT"}' | openssl base64 -A | tr '+/' '-_' | tr -d '=')
+            payload_b64=$(python3 -c "
+          import json,sys
+          print(json.dumps({
+            'iss': '$LIVEKIT_API_KEY',
+            'sub': 'orbit-recording-pipeline-gha',
+            'nbf': $now - 5,
+            'exp': $exp,
+            'video': {'roomRecord': True},
+          }))" | openssl base64 -A | tr '+/' '-_' | tr -d '=')
+            signing_input="${header_b64}.${payload_b64}"
+            sig_b64=$(printf '%s' "$signing_input" | openssl dgst -sha256 -hmac "$LIVEKIT_API_SECRET" -binary | openssl base64 -A | tr '+/' '-_' | tr -d '=')
+            printf '%s.%s' "$signing_input" "$sig_b64"
+          }
+
+          livekit_call() {
+            local method="$1" body="$2" token
+            token=$(livekit_jwt)
+            curl -sS -X POST "${LIVEKIT_HOST}/twirp/livekit.Egress/${method}" \
+              -H "Content-Type: application/json" \
+              -H "Authorization: Bearer ${token}" \
+              -d "$body"
+          }
+
+          log "listing egress for room..."
+          LIST_JSON=$(livekit_call ListEgress "$(jq -n --arg room_name "$ROOM_ID" '{room_name: $room_name}')")
+          echo "$LIST_JSON" > "${WORKDIR}/list_egress_initial.json"
+
+          echo "$LIST_JSON" | jq -c '.items // [] | .[] | select((.ended_at // 0) == 0)' | while read -r item; do
+            egress_id=$(echo "$item" | jq -r '.egress_id')
+            log "stopping still-active egress $egress_id"
+            livekit_call StopEgress "$(jq -n --arg id "$egress_id" '{egress_id: $id}')" > /dev/null || true
+          done
+
+          sleep 5
+
+          log "re-listing egress for final file results..."
+          FINAL_JSON=$(livekit_call ListEgress "$(jq -n --arg room_name "$ROOM_ID" '{room_name: $room_name}')")
+          echo "$FINAL_JSON" > "${WORKDIR}/list_egress_final.json"
+
+          ITEM_COUNT=$(echo "$FINAL_JSON" | jq '.items // [] | length')
+          if [[ "$ITEM_COUNT" -eq 0 ]]; then
+            log "no egress jobs found for this room - nothing to process. Exiting cleanly."
+            rm -rf "$WORKDIR"
+            exit 0
+          fi
+          log "found $ITEM_COUNT egress job(s)"
+
+          extract_result_key() {
+            echo "$1" | jq -r '(.file_results // [])[0] | (.filename // .file // .location // empty)'
+          }
+
+          normalize_epoch_seconds() {
+            local v="$1"
+            if [[ -z "$v" || "$v" == "0" ]]; then echo 0; return; fi
+            if (( v > 1000000000000 )); then
+              echo "scale=3; $v / 1000000000" | bc
+            else
+              echo "$v"
+            fi
+          }
+
+          declare -a RAW_KEYS=()
+          declare -a LOCAL_FILES=()
+          declare -a SOURCES=()
+          declare -a TYPES=()
+          declare -a STARTS=()
+
+          echo "$FINAL_JSON" | jq -c '.items // [] | .[]' > "${WORKDIR}/items.ndjson"
+          while IFS= read -r item; do
+            key=$(extract_result_key "$item")
+            if [[ -z "$key" ]]; then
+              log "WARNING: an egress item had no discoverable output filename - skipping it. Full item: $item"
+              continue
+            fi
+            started_raw=$(echo "$item" | jq -r '.started_at // 0')
+            started=$(normalize_epoch_seconds "$started_raw")
+
+            base=$(basename "$key")
+            base_noext="${base%.*}"
+            identity=$(echo "$base_noext" | awk -F'__' '{print $1}')
+            source_v=$(echo "$base_noext" | awk -F'__' '{print $2}')
+            type_v=$(echo "$base_noext" | awk -F'__' '{print $3}')
+
+            local_file="${WORKDIR}/raw_$(echo "$base" | tr -c 'a-zA-Z0-9._-' '_')"
+            log "downloading r2://${R2_BUCKET_NAME}/${key} -> ${local_file}"
+            rclone_ copyto "${RCLONE_REMOTE}:${R2_BUCKET_NAME}/${key}" "$local_file"
+            rc=$?
+            if [[ $rc -ne 0 || ! -s "$local_file" ]]; then
+              log "WARNING: could not download $key (rclone exit=$rc) - skipping this track"
+              rm -f "$local_file"
+              continue
+            fi
+
+            RAW_KEYS+=("$key")
+            LOCAL_FILES+=("$local_file")
+            SOURCES+=("$source_v")
+            TYPES+=("$type_v")
+            STARTS+=("$started")
+          done < "${WORKDIR}/items.ndjson"
+
+          if [[ "${#LOCAL_FILES[@]}" -eq 0 ]]; then
+            log "no raw files could be downloaded - nothing to compress."
+            exit 0
+          fi
+
+          EARLIEST_START="${STARTS[0]}"
+          for s in "${STARTS[@]}"; do
+            if (( $(echo "$s < $EARLIEST_START" | bc -l) )); then EARLIEST_START="$s"; fi
+          done
+          log "sync anchor (earliest track start): $EARLIEST_START"
+
+          FFMPEG_INPUTS=()
+          FILTER_PARTS=()
+          TOTAL_DURATION=0
+          INPUT_IDX=1
+
+          declare -a OFFSETS=()
+          declare -a DURATIONS=()
+          for i in "${!LOCAL_FILES[@]}"; do
+            f="${LOCAL_FILES[$i]}"
+            dur=$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$f" 2>/dev/null || echo 0)
+            [[ -z "$dur" || "$dur" == "N/A" ]] && dur=0
+            offset=$(echo "${STARTS[$i]} - $EARLIEST_START" | bc)
+            (( $(echo "$offset < 0" | bc -l) )) && offset=0
+            OFFSETS+=("$offset")
+            DURATIONS+=("$dur")
+            end=$(echo "$offset + $dur" | bc)
+            if (( $(echo "$end > $TOTAL_DURATION" | bc -l) )); then TOTAL_DURATION="$end"; fi
+            log "track[$i] source=${SOURCES[$i]} type=${TYPES[$i]} offset=${offset}s duration=${dur}s"
+          done
+          TOTAL_DURATION=$(echo "($TOTAL_DURATION + 2) / 1" | bc)
+          [[ "$TOTAL_DURATION" -lt 1 ]] && TOTAL_DURATION=5
+          log "total composed duration: ${TOTAL_DURATION}s"
+
+          FFMPEG_INPUTS+=(-f lavfi -i "color=c=0x0e1c76:s=1280x720:r=30:d=${TOTAL_DURATION}")
+          CUR_LABEL="0:v"
+
+          for i in "${!LOCAL_FILES[@]}"; do
+            type_v="${TYPES[$i]}"
+            source_v="${SOURCES[$i]}"
+            offset="${OFFSETS[$i]}"
+            dur="${DURATIONS[$i]}"
+            end=$(echo "$offset + $dur" | bc)
+
+            if [[ "$type_v" == "VIDEO" ]]; then
+              FFMPEG_INPUTS+=(-itsoffset "$offset" -i "${LOCAL_FILES[$i]}")
+              if [[ "$source_v" == "SCREEN_SHARE" || "$source_v" == "WHITEBOARD" ]]; then
+                FILTER_PARTS+=("[${INPUT_IDX}:v]scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2,setpts=PTS-STARTPTS+${offset}/TB[v${INPUT_IDX}]")
+                FILTER_PARTS+=("[${CUR_LABEL}][v${INPUT_IDX}]overlay=enable='between(t,${offset},${end})'[ov${INPUT_IDX}]")
+              else
+                tile_w=320; tile_h=180; margin=10
+                tile_col=$(( i % 4 ))
+                x_expr="W-${tile_w}-${margin}-((${tile_col})*(${tile_w}+${margin}))"
+                y_expr="H-${tile_h}-${margin}"
+                FILTER_PARTS+=("[${INPUT_IDX}:v]scale=${tile_w}:${tile_h}:force_original_aspect_ratio=decrease,setpts=PTS-STARTPTS+${offset}/TB[v${INPUT_IDX}]")
+                FILTER_PARTS+=("[${CUR_LABEL}][v${INPUT_IDX}]overlay=x='${x_expr}':y='${y_expr}':enable='between(t,${offset},${end})'[ov${INPUT_IDX}]")
+              fi
+              CUR_LABEL="ov${INPUT_IDX}"
+              INPUT_IDX=$((INPUT_IDX + 1))
+            fi
+          done
+          FINAL_VIDEO_LABEL="$CUR_LABEL"
+
+          AUDIO_INPUT_LABELS=()
+          for i in "${!LOCAL_FILES[@]}"; do
+            if [[ "${TYPES[$i]}" == "AUDIO" ]]; then
+              FFMPEG_INPUTS+=(-itsoffset "${OFFSETS[$i]}" -i "${LOCAL_FILES[$i]}")
+              AUDIO_INPUT_LABELS+=("${INPUT_IDX}:a")
+              INPUT_IDX=$((INPUT_IDX + 1))
+            fi
+          done
+
+          if [[ "${#AUDIO_INPUT_LABELS[@]}" -eq 0 ]]; then
+            FFMPEG_INPUTS+=(-f lavfi -i "anullsrc=r=48000:cl=stereo:d=${TOTAL_DURATION}")
+            AUDIO_INPUT_LABELS+=("${INPUT_IDX}:a")
+            INPUT_IDX=$((INPUT_IDX + 1))
+            FINAL_AUDIO_LABEL="${AUDIO_INPUT_LABELS[0]}"
+          elif [[ "${#AUDIO_INPUT_LABELS[@]}" -eq 1 ]]; then
+            FINAL_AUDIO_LABEL="${AUDIO_INPUT_LABELS[0]}"
+          else
+            mix_inputs=""
+            for lbl in "${AUDIO_INPUT_LABELS[@]}"; do mix_inputs+="[${lbl}]"; done
+            FILTER_PARTS+=("${mix_inputs}amix=inputs=${#AUDIO_INPUT_LABELS[@]}:duration=longest:dropout_transition=0[outa]")
+            FINAL_AUDIO_LABEL="outa"
+          fi
+
+          FILTER_COMPLEX=$(IFS=';'; echo "${FILTER_PARTS[*]}")
+
+          OUT_MP4="${WORKDIR}/${ROOM_ID}.mp4"
+          log "running ffmpeg..."
+          log "filter_complex: $FILTER_COMPLEX"
+
+          if [[ -n "$FILTER_COMPLEX" ]]; then
+            ffmpeg -y -hide_banner -loglevel warning \
+              "${FFMPEG_INPUTS[@]}" \
+              -filter_complex "$FILTER_COMPLEX" \
+              -map "[${FINAL_VIDEO_LABEL}]" -map "${FINAL_AUDIO_LABEL}" \
+              -c:v libx264 -preset veryfast -crf 28 -pix_fmt yuv420p \
+              -c:a aac -b:a 128k \
+              -t "$TOTAL_DURATION" -movflags +faststart \
+              "$OUT_MP4"
+          else
+            ffmpeg -y -hide_banner -loglevel warning \
+              "${FFMPEG_INPUTS[@]}" \
+              -map "0:v" -map "${FINAL_AUDIO_LABEL}" \
+              -c:v libx264 -preset veryfast -crf 28 -pix_fmt yuv420p \
+              -c:a aac -b:a 128k \
+              -t "$TOTAL_DURATION" -movflags +faststart \
+              "$OUT_MP4"
+          fi
+
+          FFMPEG_STATUS=$?
+          if [[ $FFMPEG_STATUS -ne 0 || ! -s "$OUT_MP4" ]]; then
+            fail "ffmpeg failed (exit $FFMPEG_STATUS) or produced an empty file - nothing deleted from R2."
+          fi
+
+          LOCAL_SIZE=$(stat -c%s "$OUT_MP4")
+          log "ffmpeg done: $OUT_MP4 ($LOCAL_SIZE bytes)"
+
+          FILE_NAME="${ROOM_ID}.mp4"
+          TS=$(date -u +%s)
+          R2_KEY="compressed/${ROOM_ID}/${TS}_${FILE_NAME}"
+
+          log "uploading compressed MP4 -> r2://${R2_BUCKET_NAME}/${R2_KEY}"
+          if ! rclone_ copyto "$OUT_MP4" "${RCLONE_REMOTE}:${R2_BUCKET_NAME}/${R2_KEY}"; then
+            fail "upload of compressed MP4 to R2 failed - nothing deleted."
+          fi
+
+          REMOTE_SIZE=$(rclone_ size "${RCLONE_REMOTE}:${R2_BUCKET_NAME}/${R2_KEY}" --json 2>/dev/null | jq -r '.bytes // 0')
+          if [[ "$REMOTE_SIZE" != "$LOCAL_SIZE" ]]; then
+            fail "uploaded file size mismatch (local=$LOCAL_SIZE, r2=$REMOTE_SIZE) - nothing deleted."
+          fi
+          log "upload verified: $REMOTE_SIZE bytes in R2 match local file"
+
+          RECORDING_ID=$(python3 -c "import uuid;print(uuid.uuid4())")
+          REGISTER_PAYLOAD=$(jq -n \
+            --arg room_id "$ROOM_ID" \
+            --arg recording_id "$RECORDING_ID" \
+            --arg file_name "$FILE_NAME" \
+            --arg r2_key "$R2_KEY" \
+            --argjson file_size_bytes "$LOCAL_SIZE" \
+            '{room_id: $room_id, recording_id: $recording_id, file_name: $file_name, r2_key: $r2_key, file_size_bytes: $file_size_bytes}')
+
+          log "registering recording with Supabase..."
+          REGISTER_RESPONSE=$(curl -sS -X POST "${SUPABASE_URL}/functions/v1/register-recording" \
+            -H "Content-Type: application/json" \
+            -H "x-hook-secret: ${RECORDER_HOOK_SECRET}" \
+            -d "$REGISTER_PAYLOAD")
+
+          if ! jq -e '.ok == true' <<<"$REGISTER_RESPONSE" >/dev/null 2>&1; then
+            fail "register-recording call failed: $REGISTER_RESPONSE - MP4 IS safely in R2 at ${R2_KEY}, nothing deleted."
+          fi
+          log "registered OK: $REGISTER_RESPONSE"
+
+          log "cleaning up: deleting raw per-track R2 objects..."
+          for key in "${RAW_KEYS[@]}"; do
+            rclone_ deletefile "${RCLONE_REMOTE}:${R2_BUCKET_NAME}/${key}" || true
+          done
+
+          log "==== done: room $ROOM_ID -> r2://${R2_BUCKET_NAME}/${R2_KEY} ===="
+
+      - name: Clean up workdir
+        if: always()
+        run: rm -rf "${RUNNER_TEMP:?}"/orbit-*_* 2>/dev/null || true

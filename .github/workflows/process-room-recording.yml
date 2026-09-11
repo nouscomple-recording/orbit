@@ -301,15 +301,21 @@ jobs:
               if (( $(echo "$wall_span > 0" | bc -l) )) && (( $(echo "$dur > 0" | bc -l) )); then
                 drift_pct=$(echo "scale=2; (($dur - $wall_span) / $wall_span) * 100" | bc)
                 wall_span_note=" wall_span=${wall_span}s drift=${drift_pct}%"
-                raw_factor=$(echo "scale=6; $wall_span / $dur" | bc)
-                # Clamp to a sane range - a ratio this extreme more likely
-                # means bad/missing metadata than real drift, and blindly
-                # correcting for it would do more damage than the drift.
-                clamped_factor="$raw_factor"
-                (( $(echo "$clamped_factor > 3.0" | bc -l) )) && clamped_factor="3.0"
-                (( $(echo "$clamped_factor < 0.33" | bc -l) )) && clamped_factor="0.33"
-                stretch_factor="$clamped_factor"
+                # Only correct drift that's actually worth correcting - a
+                # difference this small is more likely LiveKit timestamp
+                # rounding/noise than real drift, and resampling a track
+                # that doesn't need it only risks a small quality loss for
+                # no sync benefit. stretch_factor stays "1" (no-op) below
+                # this threshold.
                 if (( $(echo "${drift_pct#-} > 3" | bc -l) )); then
+                  raw_factor=$(echo "scale=6; $wall_span / $dur" | bc)
+                  # Clamp to a sane range - a ratio this extreme more likely
+                  # means bad/missing metadata than real drift, and blindly
+                  # correcting for it would do more damage than the drift.
+                  clamped_factor="$raw_factor"
+                  (( $(echo "$clamped_factor > 3.0" | bc -l) )) && clamped_factor="3.0"
+                  (( $(echo "$clamped_factor < 0.33" | bc -l) )) && clamped_factor="0.33"
+                  stretch_factor="$clamped_factor"
                   wall_span_note="${wall_span_note} <-- drift detected, applying stretch factor ${stretch_factor}"
                 fi
               fi
@@ -434,42 +440,37 @@ jobs:
             FINAL_AUDIO_LABEL="outa"
           fi
 
-          FILTER_COMPLEX=$(IFS=';'; echo "${FILTER_PARTS[*]}")
+          # Safety net, independent of *why* an audio stream might come up
+          # short (a drift-correction miscalculation, a source file with
+          # imprecise internal duration metadata, or anything else not yet
+          # seen): pad the final audio with silence out to the full composed
+          # duration, so a short audio stream can never leave the tail of a
+          # recording with picture but no sound. The final -t below still
+          # trims anything too long, so this only ever adds silence, never
+          # cuts real audio short. This also gives every path (0, 1, or 2+
+          # audio tracks) the same filter-graph output label, so mapping it
+          # is always just "[finalaudio]" - no more bare-stream-ref-vs-label
+          # branching needed for -map.
+          FILTER_PARTS+=("[${FINAL_AUDIO_LABEL}]apad=whole_dur=${TOTAL_DURATION}[finalaudio]")
+          AUDIO_MAP_ARG="[finalaudio]"
 
-          # -map needs a bare input stream reference (e.g. "3:a") for a
-          # literal source, but a filtergraph OUTPUT PAD (e.g. "outa", from
-          # the amix filter above) must be wrapped in brackets ("[outa]") or
-          # ffmpeg rejects it ("Invalid stream specifier: outa"). Since
-          # FINAL_AUDIO_LABEL is only ever "N:a" (0/1 audio tracks) or
-          # "outa" (2+, mixed), a simple regex picks the right form.
-          if [[ "$FINAL_AUDIO_LABEL" =~ ^[0-9]+:a$ ]]; then
-            AUDIO_MAP_ARG="$FINAL_AUDIO_LABEL"
-          else
-            AUDIO_MAP_ARG="[$FINAL_AUDIO_LABEL]"
-          fi
+          FILTER_COMPLEX=$(IFS=';'; echo "${FILTER_PARTS[*]}")
 
           OUT_MP4="${WORKDIR}/${ROOM_ID}.mp4"
           log "running ffmpeg..."
           log "filter_complex: $FILTER_COMPLEX"
 
-          if [[ -n "$FILTER_COMPLEX" ]]; then
-            ffmpeg -y -hide_banner -loglevel warning \
-              "${FFMPEG_INPUTS[@]}" \
-              -filter_complex "$FILTER_COMPLEX" \
-              -map "[${FINAL_VIDEO_LABEL}]" -map "$AUDIO_MAP_ARG" \
-              -c:v libx264 -preset veryfast -crf 28 -pix_fmt yuv420p \
-              -c:a aac -b:a 128k \
-              -t "$TOTAL_DURATION" -movflags +faststart \
-              "$OUT_MP4"
-          else
-            ffmpeg -y -hide_banner -loglevel warning \
-              "${FFMPEG_INPUTS[@]}" \
-              -map "0:v" -map "$AUDIO_MAP_ARG" \
-              -c:v libx264 -preset veryfast -crf 28 -pix_fmt yuv420p \
-              -c:a aac -b:a 128k \
-              -t "$TOTAL_DURATION" -movflags +faststart \
-              "$OUT_MP4"
-          fi
+          # FILTER_COMPLEX always has at least the apad stage above now (it
+          # is never empty), so there's always a real filter graph to run -
+          # no more empty-filter fallback path needed.
+          ffmpeg -y -hide_banner -loglevel warning \
+            "${FFMPEG_INPUTS[@]}" \
+            -filter_complex "$FILTER_COMPLEX" \
+            -map "[${FINAL_VIDEO_LABEL}]" -map "$AUDIO_MAP_ARG" \
+            -c:v libx264 -preset veryfast -crf 28 -pix_fmt yuv420p \
+            -c:a aac -b:a 128k \
+            -t "$TOTAL_DURATION" -movflags +faststart \
+            "$OUT_MP4"
 
           FFMPEG_STATUS=$?
           if [[ $FFMPEG_STATUS -ne 0 || ! -s "$OUT_MP4" ]]; then

@@ -231,6 +231,28 @@ jobs:
           [[ "$TOTAL_DURATION" -lt 1 ]] && TOTAL_DURATION=5
           log "total composed duration: ${TOTAL_DURATION}s"
 
+          # Pre-pass: collect every SCREEN_SHARE/WHITEBOARD ("full-frame")
+          # video track's own active window, so any OTHER video track (in
+          # practice: camera) can tell, at any moment t, whether something
+          # else already legitimately owns the full frame. FS_SUM_EXPR
+          # evaluates to >0 at any instant when at least one full-frame
+          # source is active, 0 otherwise (0 permanently if there are no
+          # full-frame sources at all in this room).
+          FS_TERMS=()
+          for i in "${!LOCAL_FILES[@]}"; do
+            if [[ "${TYPES[$i]}" == "VIDEO" && ( "${SOURCES[$i]}" == "SCREEN_SHARE" || "${SOURCES[$i]}" == "WHITEBOARD" ) ]]; then
+              fs_offset="${OFFSETS[$i]}"
+              fs_end=$(echo "${OFFSETS[$i]} + ${DURATIONS[$i]}" | bc)
+              FS_TERMS+=("between(t,${fs_offset},${fs_end})")
+            fi
+          done
+          if [[ "${#FS_TERMS[@]}" -eq 0 ]]; then
+            FS_SUM_EXPR="0"
+          else
+            FS_SUM_EXPR=$(IFS='+'; echo "${FS_TERMS[*]}")
+          fi
+          log "full-frame-active expression: $FS_SUM_EXPR"
+
           FFMPEG_INPUTS+=(-f lavfi -i "color=c=0x0e1c76:s=1280x720:r=30:d=${TOTAL_DURATION}")
           CUR_LABEL="0:v"
 
@@ -246,15 +268,28 @@ jobs:
               if [[ "$source_v" == "SCREEN_SHARE" || "$source_v" == "WHITEBOARD" ]]; then
                 FILTER_PARTS+=("[${INPUT_IDX}:v]scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2,setpts=PTS-STARTPTS+${offset}/TB[v${INPUT_IDX}]")
                 FILTER_PARTS+=("[${CUR_LABEL}][v${INPUT_IDX}]overlay=enable='between(t,${offset},${end})'[ov${INPUT_IDX}]")
+                CUR_LABEL="ov${INPUT_IDX}"
               else
+                # Not a designated full-frame source (camera, or anything
+                # else that lands here): goes full-frame whenever it's
+                # active and nothing else is claiming the full frame at
+                # that moment, and shrinks to a small corner tile only
+                # during the sub-window(s) where it overlaps a genuine
+                # full-frame source (screen share / whiteboard). ffmpeg
+                # can't resize one overlay dynamically, so this needs two
+                # differently-scaled copies of the same input, each gated
+                # by the opposite half of that condition.
                 tile_w=320; tile_h=180; margin=10
                 tile_col=$(( i % 4 ))
                 x_expr="W-${tile_w}-${margin}-((${tile_col})*(${tile_w}+${margin}))"
                 y_expr="H-${tile_h}-${margin}"
-                FILTER_PARTS+=("[${INPUT_IDX}:v]scale=${tile_w}:${tile_h}:force_original_aspect_ratio=decrease,setpts=PTS-STARTPTS+${offset}/TB[v${INPUT_IDX}]")
-                FILTER_PARTS+=("[${CUR_LABEL}][v${INPUT_IDX}]overlay=x='${x_expr}':y='${y_expr}':enable='between(t,${offset},${end})'[ov${INPUT_IDX}]")
+                FILTER_PARTS+=("[${INPUT_IDX}:v]split=2[cam${INPUT_IDX}tile][cam${INPUT_IDX}full]")
+                FILTER_PARTS+=("[cam${INPUT_IDX}tile]scale=${tile_w}:${tile_h}:force_original_aspect_ratio=decrease,setpts=PTS-STARTPTS+${offset}/TB[v${INPUT_IDX}t]")
+                FILTER_PARTS+=("[cam${INPUT_IDX}full]scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2,setpts=PTS-STARTPTS+${offset}/TB[v${INPUT_IDX}f]")
+                FILTER_PARTS+=("[${CUR_LABEL}][v${INPUT_IDX}t]overlay=x='${x_expr}':y='${y_expr}':enable='between(t,${offset},${end})*gt(${FS_SUM_EXPR},0)'[ov${INPUT_IDX}a]")
+                FILTER_PARTS+=("[ov${INPUT_IDX}a][v${INPUT_IDX}f]overlay=enable='between(t,${offset},${end})*lte(${FS_SUM_EXPR},0)'[ov${INPUT_IDX}]")
+                CUR_LABEL="ov${INPUT_IDX}"
               fi
-              CUR_LABEL="ov${INPUT_IDX}"
               INPUT_IDX=$((INPUT_IDX + 1))
             fi
           done

@@ -296,18 +296,31 @@ jobs:
             # the raw probed duration.
             wall_span_note=""
             stretch_factor="1"
+            # Below this, a track is too short for the drift% to mean
+            # anything: LiveKit's own start/stop bookkeeping overhead (job
+            # spin-up/teardown, timestamp rounding) is typically a second or
+            # more, so on a sub-3s clip that overhead alone can look like a
+            # huge "drift" percentage even though nothing actually stalled.
+            # Stretching a clip that short by the resulting extreme factor
+            # (seen in practice: a 0.742s screen-share clip clamped to a 3x
+            # slowdown) is far more noticeable/jarring - a visible
+            # freeze-then-lurch - than the sub-second timing error it's
+            # supposedly fixing, so these are left uncorrected on purpose.
+            MIN_DRIFT_CORRECTION_DURATION=3
             if [[ "${ENDS[$i]}" != "0" && "${STARTS[$i]}" != "0" ]]; then
               wall_span=$(echo "${ENDS[$i]} - ${STARTS[$i]}" | bc)
               if (( $(echo "$wall_span > 0" | bc -l) )) && (( $(echo "$dur > 0" | bc -l) )); then
                 drift_pct=$(echo "scale=2; (($dur - $wall_span) / $wall_span) * 100" | bc)
                 wall_span_note=" wall_span=${wall_span}s drift=${drift_pct}%"
+                if (( $(echo "$dur < $MIN_DRIFT_CORRECTION_DURATION" | bc -l) )) || (( $(echo "$wall_span < $MIN_DRIFT_CORRECTION_DURATION" | bc -l) )); then
+                  wall_span_note="${wall_span_note} <-- drift ignored: track too short (<${MIN_DRIFT_CORRECTION_DURATION}s) for a reliable drift estimate"
                 # Only correct drift that's actually worth correcting - a
                 # difference this small is more likely LiveKit timestamp
                 # rounding/noise than real drift, and resampling a track
                 # that doesn't need it only risks a small quality loss for
                 # no sync benefit. stretch_factor stays "1" (no-op) below
                 # this threshold.
-                if (( $(echo "${drift_pct#-} > 3" | bc -l) )); then
+                elif (( $(echo "${drift_pct#-} > 3" | bc -l) )); then
                   raw_factor=$(echo "scale=6; $wall_span / $dur" | bc)
                   # Clamp to a sane range - a ratio this extreme more likely
                   # means bad/missing metadata than real drift, and blindly

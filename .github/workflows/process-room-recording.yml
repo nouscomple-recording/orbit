@@ -467,8 +467,8 @@ jobs:
             "${FFMPEG_INPUTS[@]}" \
             -filter_complex "$FILTER_COMPLEX" \
             -map "[${FINAL_VIDEO_LABEL}]" -map "$AUDIO_MAP_ARG" \
-            -c:v libx264 -preset veryfast -crf 28 -pix_fmt yuv420p \
-            -c:a aac -b:a 128k \
+            -c:v libx264 -preset fast -crf 20 -pix_fmt yuv420p \
+            -c:a aac -b:a 160k \
             -t "$TOTAL_DURATION" -movflags +faststart \
             "$OUT_MP4"
 

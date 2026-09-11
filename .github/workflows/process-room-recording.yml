@@ -111,13 +111,31 @@ jobs:
             printf '%s.%s' "$signing_input" "$sig_b64"
           }
 
+          # Retries transient network failures (e.g. the "Recv failure:
+          # Connection reset by peer" seen against the LiveKit host) up to 3
+          # times before giving up. Always just returns whatever it got -
+          # callers that need to treat an empty/invalid response as fatal
+          # check for that explicitly (see the FINAL_JSON validation below),
+          # rather than this function silently deciding what's fatal for
+          # every caller (StopEgress calls are fine to just skip on failure).
           livekit_call() {
-            local method="$1" body="$2" token
+            local method="$1" body="$2" token attempt response rc
             token=$(livekit_jwt)
-            curl -sS -X POST "${LIVEKIT_HOST}/twirp/livekit.Egress/${method}" \
-              -H "Content-Type: application/json" \
-              -H "Authorization: Bearer ${token}" \
-              -d "$body"
+            for attempt in 1 2 3; do
+              response=$(curl -sS --max-time 30 -X POST "${LIVEKIT_HOST}/twirp/livekit.Egress/${method}" \
+                -H "Content-Type: application/json" \
+                -H "Authorization: Bearer ${token}" \
+                -d "$body")
+              rc=$?
+              if [[ $rc -eq 0 && -n "$response" ]] && echo "$response" | jq empty >/dev/null 2>&1; then
+                echo "$response"
+                return 0
+              fi
+              log "WARNING: livekit_call $method attempt $attempt/3 failed (curl exit=$rc) or returned invalid JSON - retrying in 3s..."
+              sleep 3
+            done
+            log "WARNING: livekit_call $method failed after 3 attempts - returning empty."
+            echo ""
           }
 
           log "listing egress for room..."
@@ -135,6 +153,18 @@ jobs:
           log "re-listing egress for final file results..."
           FINAL_JSON=$(livekit_call ListEgress "$(jq -n --arg room_name "$ROOM_ID" '{room_name: $room_name}')")
           echo "$FINAL_JSON" > "${WORKDIR}/list_egress_final.json"
+
+          # This call is critical: if it comes back empty/invalid (e.g. a
+          # transient network reset talking to the LiveKit host) we must NOT
+          # silently treat that the same as "genuinely zero egress jobs" -
+          # that previously caused the workflow to exit 0 having done
+          # nothing, with no compressed MP4 ever produced and no indication
+          # anything went wrong. Fail loudly instead; raw files are
+          # untouched in R2 (cleanup never runs before this point), so simply
+          # re-running the workflow once LiveKit is reachable again is safe.
+          if ! echo "$FINAL_JSON" | jq empty >/dev/null 2>&1; then
+            fail "ListEgress (final) returned no valid response after retries - likely a transient network issue reaching LiveKit. Raw per-track files are still safely in R2 (nothing was deleted). Re-run this workflow (Run workflow, not Re-run jobs) once LiveKit is reachable."
+          fi
 
           ITEM_COUNT=$(echo "$FINAL_JSON" | jq '.items // [] | length')
           if [[ "$ITEM_COUNT" -eq 0 ]]; then
@@ -156,6 +186,24 @@ jobs:
             else
               echo "$v"
             fi
+          }
+
+          # ffmpeg's atempo filter only accepts a tempo change within
+          # [0.5, 2.0] per stage - anything outside that (which a badly
+          # drifted track can easily need) has to be expressed as a chain of
+          # in-range stages whose product is the real target.
+          build_atempo_chain() {
+            local target="$1" chain=""
+            while (( $(echo "$target > 2.0" | bc -l) )); do
+              chain="${chain}atempo=2.0,"
+              target=$(echo "scale=6; $target / 2.0" | bc)
+            done
+            while (( $(echo "$target < 0.5" | bc -l) )); do
+              chain="${chain}atempo=0.5,"
+              target=$(echo "scale=6; $target / 0.5" | bc)
+            done
+            chain="${chain}atempo=${target}"
+            echo "$chain"
           }
 
           declare -a RAW_KEYS=()
@@ -219,6 +267,8 @@ jobs:
 
           declare -a OFFSETS=()
           declare -a DURATIONS=()
+          declare -a STRETCH=()
+          declare -a STRETCHED_DURATIONS=()
           for i in "${!LOCAL_FILES[@]}"; do
             f="${LOCAL_FILES[$i]}"
             dur=$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$f" 2>/dev/null || echo 0)
@@ -227,32 +277,52 @@ jobs:
             (( $(echo "$offset < 0" | bc -l) )) && offset=0
             OFFSETS+=("$offset")
             DURATIONS+=("$dur")
-            end=$(echo "$offset + $dur" | bc)
-            if (( $(echo "$end > $TOTAL_DURATION" | bc -l) )); then TOTAL_DURATION="$end"; fi
 
-            # Diagnostic only (does not change compositing yet): compare this
-            # track's PROBED file duration against how much real wall-clock
-            # time LiveKit says actually elapsed between started_at and
-            # ended_at for this egress job. If a track's internal timeline
-            # runs faster or slower than real time (e.g. its encoder
-            # stalled/dropped frames under CPU or bandwidth pressure while
-            # multiple tracks were being sent from one machine), the two
-            # will disagree - and that mismatch is exactly what produces
-            # audio/video drift that grows over the length of a clip,
-            # even though this track's *start* is aligned correctly.
+            # Compare this track's PROBED file duration against how much
+            # real wall-clock time LiveKit says actually elapsed between
+            # started_at and ended_at for this egress job. When a track's
+            # encoder stalled/dropped frames under CPU or bandwidth pressure
+            # (e.g. camera + whiteboard + screen share + mic all streaming
+            # from one machine at once), its file ends up covering only a
+            # fraction of the real time it was recorded over - exactly what
+            # produces audio/video drift, even though this track's *start*
+            # is aligned correctly. STRETCH[i] is the correction: how much to
+            # linearly stretch this track's own internal timeline so it
+            # occupies its true wall-clock span instead of a compressed one.
+            # STRETCHED_DURATIONS[i] is what that track will actually occupy
+            # in the final composite once that correction is applied, and is
+            # what everything downstream (total duration, overlay enable
+            # windows, the full-frame-active expression) must use instead of
+            # the raw probed duration.
             wall_span_note=""
+            stretch_factor="1"
             if [[ "${ENDS[$i]}" != "0" && "${STARTS[$i]}" != "0" ]]; then
               wall_span=$(echo "${ENDS[$i]} - ${STARTS[$i]}" | bc)
               if (( $(echo "$wall_span > 0" | bc -l) )) && (( $(echo "$dur > 0" | bc -l) )); then
                 drift_pct=$(echo "scale=2; (($dur - $wall_span) / $wall_span) * 100" | bc)
                 wall_span_note=" wall_span=${wall_span}s drift=${drift_pct}%"
+                raw_factor=$(echo "scale=6; $wall_span / $dur" | bc)
+                # Clamp to a sane range - a ratio this extreme more likely
+                # means bad/missing metadata than real drift, and blindly
+                # correcting for it would do more damage than the drift.
+                clamped_factor="$raw_factor"
+                (( $(echo "$clamped_factor > 3.0" | bc -l) )) && clamped_factor="3.0"
+                (( $(echo "$clamped_factor < 0.33" | bc -l) )) && clamped_factor="0.33"
+                stretch_factor="$clamped_factor"
                 if (( $(echo "${drift_pct#-} > 3" | bc -l) )); then
-                  wall_span_note="${wall_span_note} <-- WARNING: probed duration and real elapsed time disagree by more than 3%, likely internal clock drift on this track"
+                  wall_span_note="${wall_span_note} <-- drift detected, applying stretch factor ${stretch_factor}"
                 fi
               fi
             else
               wall_span_note=" wall_span=unavailable(no ended_at from LiveKit)"
             fi
+            STRETCH+=("$stretch_factor")
+            stretched_dur=$(echo "scale=6; $dur * $stretch_factor" | bc)
+            STRETCHED_DURATIONS+=("$stretched_dur")
+
+            end=$(echo "$offset + $stretched_dur" | bc)
+            if (( $(echo "$end > $TOTAL_DURATION" | bc -l) )); then TOTAL_DURATION="$end"; fi
+
             log "track[$i] source=${SOURCES[$i]} type=${TYPES[$i]} offset=${offset}s duration=${dur}s${wall_span_note}"
           done
           TOTAL_DURATION=$(echo "($TOTAL_DURATION + 2) / 1" | bc)
@@ -260,17 +330,18 @@ jobs:
           log "total composed duration: ${TOTAL_DURATION}s"
 
           # Pre-pass: collect every SCREEN_SHARE/WHITEBOARD ("full-frame")
-          # video track's own active window, so any OTHER video track (in
-          # practice: camera) can tell, at any moment t, whether something
-          # else already legitimately owns the full frame. FS_SUM_EXPR
-          # evaluates to >0 at any instant when at least one full-frame
-          # source is active, 0 otherwise (0 permanently if there are no
-          # full-frame sources at all in this room).
+          # video track's own active window (using its STRETCHED duration,
+          # since that's how long it actually plays in the composite), so
+          # any OTHER video track (in practice: camera) can tell, at any
+          # moment t, whether something else already legitimately owns the
+          # full frame. FS_SUM_EXPR evaluates to >0 at any instant when at
+          # least one full-frame source is active, 0 otherwise (0
+          # permanently if there are no full-frame sources in this room).
           FS_TERMS=()
           for i in "${!LOCAL_FILES[@]}"; do
             if [[ "${TYPES[$i]}" == "VIDEO" && ( "${SOURCES[$i]}" == "SCREEN_SHARE" || "${SOURCES[$i]}" == "WHITEBOARD" ) ]]; then
               fs_offset="${OFFSETS[$i]}"
-              fs_end=$(echo "${OFFSETS[$i]} + ${DURATIONS[$i]}" | bc)
+              fs_end=$(echo "${OFFSETS[$i]} + ${STRETCHED_DURATIONS[$i]}" | bc)
               FS_TERMS+=("between(t,${fs_offset},${fs_end})")
             fi
           done
@@ -288,13 +359,14 @@ jobs:
             type_v="${TYPES[$i]}"
             source_v="${SOURCES[$i]}"
             offset="${OFFSETS[$i]}"
-            dur="${DURATIONS[$i]}"
+            dur="${STRETCHED_DURATIONS[$i]}"
             end=$(echo "$offset + $dur" | bc)
 
             if [[ "$type_v" == "VIDEO" ]]; then
               FFMPEG_INPUTS+=(-itsoffset "$offset" -i "${LOCAL_FILES[$i]}")
+              stretch="${STRETCH[$i]}"
               if [[ "$source_v" == "SCREEN_SHARE" || "$source_v" == "WHITEBOARD" ]]; then
-                FILTER_PARTS+=("[${INPUT_IDX}:v]scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2,setpts=PTS-STARTPTS+${offset}/TB[v${INPUT_IDX}]")
+                FILTER_PARTS+=("[${INPUT_IDX}:v]scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2,setpts=(PTS-STARTPTS)*${stretch}+${offset}/TB[v${INPUT_IDX}]")
                 FILTER_PARTS+=("[${CUR_LABEL}][v${INPUT_IDX}]overlay=enable='between(t,${offset},${end})'[ov${INPUT_IDX}]")
                 CUR_LABEL="ov${INPUT_IDX}"
               else
@@ -312,8 +384,8 @@ jobs:
                 x_expr="W-${tile_w}-${margin}-((${tile_col})*(${tile_w}+${margin}))"
                 y_expr="H-${tile_h}-${margin}"
                 FILTER_PARTS+=("[${INPUT_IDX}:v]split=2[cam${INPUT_IDX}tile][cam${INPUT_IDX}full]")
-                FILTER_PARTS+=("[cam${INPUT_IDX}tile]scale=${tile_w}:${tile_h}:force_original_aspect_ratio=decrease,setpts=PTS-STARTPTS+${offset}/TB[v${INPUT_IDX}t]")
-                FILTER_PARTS+=("[cam${INPUT_IDX}full]scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2,setpts=PTS-STARTPTS+${offset}/TB[v${INPUT_IDX}f]")
+                FILTER_PARTS+=("[cam${INPUT_IDX}tile]scale=${tile_w}:${tile_h}:force_original_aspect_ratio=decrease,setpts=(PTS-STARTPTS)*${stretch}+${offset}/TB[v${INPUT_IDX}t]")
+                FILTER_PARTS+=("[cam${INPUT_IDX}full]scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2,setpts=(PTS-STARTPTS)*${stretch}+${offset}/TB[v${INPUT_IDX}f]")
                 FILTER_PARTS+=("[${CUR_LABEL}][v${INPUT_IDX}t]overlay=x='${x_expr}':y='${y_expr}':enable='between(t,${offset},${end})*gt(${FS_SUM_EXPR},0)'[ov${INPUT_IDX}a]")
                 FILTER_PARTS+=("[ov${INPUT_IDX}a][v${INPUT_IDX}f]overlay=enable='between(t,${offset},${end})*lte(${FS_SUM_EXPR},0)'[ov${INPUT_IDX}]")
                 CUR_LABEL="ov${INPUT_IDX}"
@@ -327,7 +399,23 @@ jobs:
           for i in "${!LOCAL_FILES[@]}"; do
             if [[ "${TYPES[$i]}" == "AUDIO" ]]; then
               FFMPEG_INPUTS+=(-itsoffset "${OFFSETS[$i]}" -i "${LOCAL_FILES[$i]}")
-              AUDIO_INPUT_LABELS+=("${INPUT_IDX}:a")
+              stretch="${STRETCH[$i]}"
+              # Same drift correction as video, applied to audio: atempo
+              # changes playback speed (and therefore duration) instead of
+              # ffmpeg's scale/setpts, so a track whose probed duration ran
+              # short of its real wall-clock span gets slowed down by
+              # 1/stretch to fill that span instead of ending early and
+              # drifting out of sync with everything else.
+              needs_correction=1
+              (( $(echo "${stretch#-} > 0.99" | bc -l) )) && (( $(echo "${stretch#-} < 1.01" | bc -l) )) && needs_correction=0
+              if [[ "$needs_correction" -eq 1 ]]; then
+                atempo_target=$(echo "scale=6; 1 / $stretch" | bc)
+                atempo_chain=$(build_atempo_chain "$atempo_target")
+                FILTER_PARTS+=("[${INPUT_IDX}:a]${atempo_chain},asetpts=PTS-STARTPTS+${OFFSETS[$i]}/TB[a${INPUT_IDX}p]")
+              else
+                FILTER_PARTS+=("[${INPUT_IDX}:a]asetpts=PTS-STARTPTS+${OFFSETS[$i]}/TB[a${INPUT_IDX}p]")
+              fi
+              AUDIO_INPUT_LABELS+=("a${INPUT_IDX}p")
               INPUT_IDX=$((INPUT_IDX + 1))
             fi
           done

@@ -163,6 +163,7 @@ jobs:
           declare -a SOURCES=()
           declare -a TYPES=()
           declare -a STARTS=()
+          declare -a ENDS=()
 
           echo "$FINAL_JSON" | jq -c '.items // [] | .[]' > "${WORKDIR}/items.ndjson"
           while IFS= read -r item; do
@@ -173,6 +174,8 @@ jobs:
             fi
             started_raw=$(echo "$item" | jq -r '.started_at // 0')
             started=$(normalize_epoch_seconds "$started_raw")
+            ended_raw=$(echo "$item" | jq -r '.ended_at // 0')
+            ended=$(normalize_epoch_seconds "$ended_raw")
 
             base=$(basename "$key")
             base_noext="${base%.*}"
@@ -195,6 +198,7 @@ jobs:
             SOURCES+=("$source_v")
             TYPES+=("$type_v")
             STARTS+=("$started")
+            ENDS+=("$ended")
           done < "${WORKDIR}/items.ndjson"
 
           if [[ "${#LOCAL_FILES[@]}" -eq 0 ]]; then
@@ -225,7 +229,31 @@ jobs:
             DURATIONS+=("$dur")
             end=$(echo "$offset + $dur" | bc)
             if (( $(echo "$end > $TOTAL_DURATION" | bc -l) )); then TOTAL_DURATION="$end"; fi
-            log "track[$i] source=${SOURCES[$i]} type=${TYPES[$i]} offset=${offset}s duration=${dur}s"
+
+            # Diagnostic only (does not change compositing yet): compare this
+            # track's PROBED file duration against how much real wall-clock
+            # time LiveKit says actually elapsed between started_at and
+            # ended_at for this egress job. If a track's internal timeline
+            # runs faster or slower than real time (e.g. its encoder
+            # stalled/dropped frames under CPU or bandwidth pressure while
+            # multiple tracks were being sent from one machine), the two
+            # will disagree - and that mismatch is exactly what produces
+            # audio/video drift that grows over the length of a clip,
+            # even though this track's *start* is aligned correctly.
+            wall_span_note=""
+            if [[ "${ENDS[$i]}" != "0" && "${STARTS[$i]}" != "0" ]]; then
+              wall_span=$(echo "${ENDS[$i]} - ${STARTS[$i]}" | bc)
+              if (( $(echo "$wall_span > 0" | bc -l) )) && (( $(echo "$dur > 0" | bc -l) )); then
+                drift_pct=$(echo "scale=2; (($dur - $wall_span) / $wall_span) * 100" | bc)
+                wall_span_note=" wall_span=${wall_span}s drift=${drift_pct}%"
+                if (( $(echo "${drift_pct#-} > 3" | bc -l) )); then
+                  wall_span_note="${wall_span_note} <-- WARNING: probed duration and real elapsed time disagree by more than 3%, likely internal clock drift on this track"
+                fi
+              fi
+            else
+              wall_span_note=" wall_span=unavailable(no ended_at from LiveKit)"
+            fi
+            log "track[$i] source=${SOURCES[$i]} type=${TYPES[$i]} offset=${offset}s duration=${dur}s${wall_span_note}"
           done
           TOTAL_DURATION=$(echo "($TOTAL_DURATION + 2) / 1" | bc)
           [[ "$TOTAL_DURATION" -lt 1 ]] && TOTAL_DURATION=5

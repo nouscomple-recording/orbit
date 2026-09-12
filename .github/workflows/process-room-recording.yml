@@ -953,6 +953,75 @@ jobs:
               if [[ "${C_TYPES[$i]}" == "AUDIO" ]]; then
                 FFMPEG_INPUTS+=(-itsoffset "${OFFSETS[$i]}" -i "${C_LOCAL_FILES[$i]}")
                 stretch="${STRETCH[$i]}"
+
+                # ---- Per-track cleanup/leveling, before mixing ----
+                #
+                # A raw MICROPHONE capture picks up whatever's in the room
+                # continuously - fan/AC hum, hiss, echo - at a level that,
+                # measured directly against a real SCREEN_SHARE_AUDIO track
+                # from this pipeline, came out roughly 17dB louder on
+                # average than the shared audio (a loopback capture of
+                # whatever the presenter is playing back, typically
+                # captured much quieter). ffmpeg's amix below combines
+                # tracks at their ORIGINAL relative volumes - it has no
+                # concept of "wanted content" vs "background noise", so
+                # that ~17dB gap survives straight into the mix and buries
+                # the screen audio under the mic's noise floor for the
+                # whole time both are present, exactly as reported ("shared
+                # audio gets suppressed completely by the background noise
+                # of mic"). Two complementary, deterministic fixes, applied
+                # per track before mixing:
+                #  - the mic specifically gets a high-pass (cuts AC hum/
+                #    rumble below speech's own range) and an FFT noise
+                #    reducer (afftdn - suppresses a continuous, stable
+                #    noise floor like fan/hiss without touching transient
+                #    speech), so there's less background noise left to
+                #    compete with the screen audio in the first place.
+                #  - EVERY audio track (mic included) is then measured
+                #    (mean_volume, via a throwaway ffmpeg pass through the
+                #    SAME cleanup filter used above so the measurement
+                #    matches what actually reaches the mix) and given a
+                #    fixed, static dB gain to bring it to a common target
+                #    loudness before mixing - not ffmpeg's loudnorm, which
+                #    turned out to apply a time-varying gain that can pump
+                #    residual noise back up unpredictably (verified: it
+                #    measurably made a synthetic version of this exact mic/
+                #    screen mismatch WORSE in testing); a single measured,
+                #    clamped, static gain per track is fully predictable
+                #    and directly closes the measured gap instead. A track
+                #    that's essentially silent to begin with is left alone
+                #    (no gain is worth applying to a near-empty track, and
+                #    boosting it would just make its own noise floor
+                #    louder for no benefit), and the gain is clamped either
+                #    way so a bad measurement can never produce an extreme
+                #    swing. alimiter is a cheap safety net against the rare
+                #    case a boosted track's true peaks (as opposed to its
+                #    average level, which is all a single gain is based on)
+                #    come close to clipping.
+                TARGET_AUDIO_MEAN_DB=-20
+                MIN_MEASURABLE_MEAN_DB=-70
+                MAX_AUDIO_GAIN_DB=24
+                MIN_AUDIO_GAIN_DB=-12
+                if [[ "${C_SOURCES[$i]}" == "MICROPHONE" ]]; then
+                  audio_pre_filter="highpass=f=80,afftdn=nr=30:nf=-30"
+                else
+                  audio_pre_filter=""
+                fi
+                measured_mean_db=$(ffmpeg -hide_banner -nostdin -i "${C_LOCAL_FILES[$i]}" \
+                  -af "${audio_pre_filter:+${audio_pre_filter},}volumedetect" -f null - 2>&1 \
+                  | grep -oP 'mean_volume:\s*\K[-0-9.]+' | tail -1 || true)
+                if [[ -z "$measured_mean_db" ]]; then
+                  audio_gain_db="0"
+                elif (( $(echo "$measured_mean_db <= $MIN_MEASURABLE_MEAN_DB" | bc -l) )); then
+                  audio_gain_db="0"
+                else
+                  audio_gain_db=$(echo "scale=3; $TARGET_AUDIO_MEAN_DB - ($measured_mean_db)" | bc)
+                  (( $(echo "$audio_gain_db > $MAX_AUDIO_GAIN_DB" | bc -l) )) && audio_gain_db="$MAX_AUDIO_GAIN_DB"
+                  (( $(echo "$audio_gain_db < $MIN_AUDIO_GAIN_DB" | bc -l) )) && audio_gain_db="$MIN_AUDIO_GAIN_DB"
+                fi
+                log "session $cluster_num track[$i] source=${C_SOURCES[$i]} audio: measured_mean=${measured_mean_db:-n/a}dB applying gain=${audio_gain_db}dB"
+                audio_clean_chain="${audio_pre_filter:+${audio_pre_filter},}volume=${audio_gain_db}dB,alimiter=limit=0.97,"
+
                 # Same drift correction as video, applied to audio: atempo
                 # changes playback speed (and therefore duration) instead
                 # of ffmpeg's scale/setpts, so a track whose probed
@@ -965,9 +1034,9 @@ jobs:
                 if [[ "$needs_correction" -eq 1 ]]; then
                   atempo_target=$(echo "scale=6; 1 / $stretch" | bc)
                   atempo_chain=$(build_atempo_chain "$atempo_target")
-                  FILTER_PARTS+=("[${INPUT_IDX}:a]${atempo_chain},asetpts=PTS-STARTPTS+${OFFSETS[$i]}/TB[a${INPUT_IDX}p]")
+                  FILTER_PARTS+=("[${INPUT_IDX}:a]${audio_clean_chain}${atempo_chain},asetpts=PTS-STARTPTS+${OFFSETS[$i]}/TB[a${INPUT_IDX}p]")
                 else
-                  FILTER_PARTS+=("[${INPUT_IDX}:a]asetpts=PTS-STARTPTS+${OFFSETS[$i]}/TB[a${INPUT_IDX}p]")
+                  FILTER_PARTS+=("[${INPUT_IDX}:a]${audio_clean_chain}asetpts=PTS-STARTPTS+${OFFSETS[$i]}/TB[a${INPUT_IDX}p]")
                 fi
                 AUDIO_INPUT_LABELS+=("a${INPUT_IDX}p")
                 INPUT_IDX=$((INPUT_IDX + 1))
@@ -984,7 +1053,14 @@ jobs:
             else
               mix_inputs=""
               for lbl in "${AUDIO_INPUT_LABELS[@]}"; do mix_inputs+="[${lbl}]"; done
-              FILTER_PARTS+=("${mix_inputs}amix=inputs=${#AUDIO_INPUT_LABELS[@]}:duration=longest:dropout_transition=0[outa]")
+              # normalize=0: each track was already brought to a consistent
+              # target loudness above, so amix's own default behavior of
+              # additionally dividing the mix by the input count is no
+              # longer needed to avoid clipping here (loudnorm's own true
+              # peak ceiling already does that) and would only make the
+              # whole mix quieter without changing the mic/screen balance
+              # that was actually the problem.
+              FILTER_PARTS+=("${mix_inputs}amix=inputs=${#AUDIO_INPUT_LABELS[@]}:duration=longest:dropout_transition=0:normalize=0[outa]")
               FINAL_AUDIO_LABEL="outa"
             fi
 

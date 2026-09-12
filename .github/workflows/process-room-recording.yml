@@ -479,6 +479,28 @@ jobs:
               # it's supposedly fixing, so these are left uncorrected on
               # purpose.
               MIN_DRIFT_CORRECTION_DURATION=3
+              # Beyond this, the mismatch is no longer "the recording clock
+              # ran a little fast/slow" - it means a real chunk of wall time
+              # has NO corresponding frames at all (the common real-world
+              # cause: a presenter's camera was genuinely switched off, not
+              # merely muted, for a big chunk of the session, so LiveKit's
+              # egress simply had nothing to encode during that span, and
+              # the probed file duration comes back far shorter than the
+              # wall-clock time the egress job actually ran for). Stretching
+              # a clip like that (previously clamped up to 3x) to fill its
+              # full wall-clock span turns a handful of real seconds of
+              # footage into extreme slow motion - every frame gets shown
+              # several times in a row, which looks exactly like the video
+              # "freezing" even though nothing is technically frozen, and it
+              # also drags out the reserved camera-column window (see
+              # CAMERA_VISIBLE_SUM_EXPR below) to match, keeping the column
+              # up long after the real footage in it has ended. The correct
+              # response to a gap this large isn't to slow footage down to
+              # fill it - it's to play the real footage at (near) its own
+              # natural speed and have nothing for the rest of the span,
+              # which also lets the camera column disappear again as soon
+              # as the real footage actually ends.
+              MAX_PLAUSIBLE_DRIFT_PCT=40
               if [[ "${C_ENDS[$i]}" != "0" && "${C_STARTS[$i]}" != "0" ]]; then
                 wall_span=$(echo "${C_ENDS[$i]} - ${C_STARTS[$i]}" | bc)
                 if (( $(echo "$wall_span > 0" | bc -l) )) && (( $(echo "$dur > 0" | bc -l) )); then
@@ -492,15 +514,18 @@ jobs:
                   # that doesn't need it only risks a small quality loss for
                   # no sync benefit. stretch_factor stays "1" (no-op) below
                   # this threshold.
+                  elif (( $(echo "${drift_pct#-} > $MAX_PLAUSIBLE_DRIFT_PCT" | bc -l) )); then
+                    wall_span_note="${wall_span_note} <-- drift too large to be clock/encoder skew (>${MAX_PLAUSIBLE_DRIFT_PCT}%) - treated as a genuine content gap instead of stretched into slow motion; playing at native speed"
                   elif (( $(echo "${drift_pct#-} > 3" | bc -l) )); then
                     raw_factor=$(echo "scale=6; $wall_span / $dur" | bc)
-                    # Clamp to a sane range - a ratio this extreme more
-                    # likely means bad/missing metadata than real drift, and
-                    # blindly correcting for it would do more damage than
-                    # the drift.
+                    # Clamp to a tight, plausible clock/encoder-skew range.
+                    # Anything that reaches this line is already guaranteed
+                    # inside roughly this range by the MAX_PLAUSIBLE_DRIFT_PCT
+                    # gate above - this clamp is only a defense-in-depth
+                    # safety net, not the primary control anymore.
                     clamped_factor="$raw_factor"
-                    (( $(echo "$clamped_factor > 3.0" | bc -l) )) && clamped_factor="3.0"
-                    (( $(echo "$clamped_factor < 0.33" | bc -l) )) && clamped_factor="0.33"
+                    (( $(echo "$clamped_factor > 1.7" | bc -l) )) && clamped_factor="1.7"
+                    (( $(echo "$clamped_factor < 0.6" | bc -l) )) && clamped_factor="0.6"
                     stretch_factor="$clamped_factor"
                     wall_span_note="${wall_span_note} <-- drift detected, applying stretch factor ${stretch_factor}"
                   fi
@@ -544,6 +569,66 @@ jobs:
               FS_SUM_EXPR=$(IFS='+'; echo "${FS_TERMS[*]}")
             fi
             log "session $cluster_num full-frame-active expression: $FS_SUM_EXPR"
+
+            # ---- Hold the last frame of a full-frame source through any
+            # gap that follows it, instead of cutting to the bare navy
+            # background ----
+            #
+            # Whenever a screen share/whiteboard ended (or was paused and
+            # re-shared later, producing a separate egress track with a gap
+            # in between) and nothing else was active yet, the composite
+            # used to fall straight through to the plain color background -
+            # sometimes for tens of seconds at a time, audio still playing
+            # underneath - which reads as broken/glitchy rather than a
+            # deliberate blank moment (this is what was reported as "screen
+            # sharing isn't looking fine"). A real recording studio would
+            # hold the last slide/frame on a frozen "slate" until the next
+            # thing begins instead of cutting to black, so that's what this
+            # does: each full-frame source's hold window runs from its own
+            # end until the NEXT full-frame source begins (or the end of
+            # the session, if it's the last one) - but a genuine live
+            # camera instant (per CAMERA_VISIBLE_SUM_EXPR) always wins over
+            # a frozen slate, so the hold is gated to only show while no
+            # camera is visible either. This deliberately does NOT apply to
+            # camera tracks themselves - holding a frozen camera frame
+            # during a real camera gap is exactly the earlier "static photo
+            # sitting in the corner/full frame" bug the freeze-detection
+            # logic above exists to eliminate, so a camera gap still
+            # correctly shows nothing rather than a stale face.
+            declare -A HOLD_END HOLD_DUR
+            declare -a FS_IDX_SORTED=()
+            for i in "${!C_LOCAL_FILES[@]}"; do
+              [[ "${C_TYPES[$i]}" == "VIDEO" && ( "${C_SOURCES[$i]}" == "SCREEN_SHARE" || "${C_SOURCES[$i]}" == "WHITEBOARD" ) ]] || continue
+              FS_IDX_SORTED+=("$i")
+            done
+            # Insertion sort by OFFSETS - the number of full-frame tracks in
+            # one session is always tiny, so simplicity wins over speed.
+            for ((a=1; a<${#FS_IDX_SORTED[@]}; a++)); do
+              key="${FS_IDX_SORTED[$a]}"
+              key_off="${OFFSETS[$key]}"
+              b=$((a-1))
+              while [[ $b -ge 0 ]] && (( $(echo "${OFFSETS[${FS_IDX_SORTED[$b]}]} > $key_off" | bc -l) )); do
+                FS_IDX_SORTED[$((b+1))]="${FS_IDX_SORTED[$b]}"
+                b=$((b-1))
+              done
+              FS_IDX_SORTED[$((b+1))]="$key"
+            done
+            for idx in "${!FS_IDX_SORTED[@]}"; do
+              i="${FS_IDX_SORTED[$idx]}"
+              own_end=$(echo "${OFFSETS[$i]} + ${STRETCHED_DURATIONS[$i]}" | bc)
+              next_pos=$((idx+1))
+              if [[ "$next_pos" -lt "${#FS_IDX_SORTED[@]}" ]]; then
+                next_i="${FS_IDX_SORTED[$next_pos]}"
+                hold_end="${OFFSETS[$next_i]}"
+              else
+                hold_end="$TOTAL_DURATION"
+              fi
+              (( $(echo "$hold_end < $own_end" | bc -l) )) && hold_end="$own_end"
+              hold_dur=$(echo "$hold_end - $own_end" | bc)
+              (( $(echo "$hold_dur < 0" | bc -l) )) && hold_dur=0
+              HOLD_END[$i]="$hold_end"
+              HOLD_DUR[$i]="$hold_dur"
+            done
 
             FFMPEG_INPUTS+=(-f lavfi -i "color=c=0x0e1c76:s=1280x720:r=30:d=${TOTAL_DURATION}")
             CUR_LABEL="0:v"
@@ -714,8 +799,8 @@ jobs:
             fi
             log "session $cluster_num camera-visible-now expression: $CAMERA_VISIBLE_SUM_EXPR"
 
-            unset VLABEL_FULL VLABEL_TILE VLABEL_NARROW VLABEL_WIDE IS_FS_SOURCE TILE_X TILE_Y
-            declare -A VLABEL_FULL VLABEL_TILE VLABEL_NARROW VLABEL_WIDE IS_FS_SOURCE TILE_X TILE_Y
+            unset VLABEL_FULL VLABEL_TILE VLABEL_NARROW VLABEL_WIDE VLABEL_HOLD IS_FS_SOURCE TILE_X TILE_Y
+            declare -A VLABEL_FULL VLABEL_TILE VLABEL_NARROW VLABEL_WIDE VLABEL_HOLD IS_FS_SOURCE TILE_X TILE_Y
             TILE_COUNTER=0
             for i in "${!C_LOCAL_FILES[@]}"; do
               type_v="${C_TYPES[$i]}"
@@ -735,11 +820,24 @@ jobs:
                 # Pass 2 below picks whichever one actually applies at each
                 # moment via CAMERA_VISIBLE_SUM_EXPR - this only prepares
                 # both; it doesn't decide between them.
-                FILTER_PARTS+=("[${INPUT_IDX}:v]split=2[fs${INPUT_IDX}narrow][fs${INPUT_IDX}wide]")
+                FILTER_PARTS+=("[${INPUT_IDX}:v]split=3[fs${INPUT_IDX}narrow][fs${INPUT_IDX}wide][fs${INPUT_IDX}hold]")
                 FILTER_PARTS+=("[fs${INPUT_IDX}narrow]scale=${TILE_COL_X}:720:force_original_aspect_ratio=decrease,pad=${TILE_COL_X}:720:(ow-iw)/2:(oh-ih)/2,setpts=(PTS-STARTPTS)*${stretch}+${offset}/TB[v${INPUT_IDX}n]")
                 FILTER_PARTS+=("[fs${INPUT_IDX}wide]scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2,setpts=(PTS-STARTPTS)*${stretch}+${offset}/TB[v${INPUT_IDX}w]")
+                # A third copy, held on its own last frame for the gap that
+                # follows this source (see HOLD_DUR pre-pass above) instead
+                # of letting the composite fall through to blank navy.
+                # tpad's stop_duration is measured on THIS stream's own
+                # pre-setpts timeline, but setpts below multiplies every PTS
+                # (including the padded tail) by $stretch - so the padding
+                # has to be pre-divided by $stretch here for the tail to
+                # actually last HOLD_DUR seconds once setpts has run.
+                hold_dur_raw="${HOLD_DUR[$i]:-0}"
+                hold_pad=$(echo "scale=6; $hold_dur_raw / $stretch" | bc)
+                (( $(echo "$hold_pad < 0" | bc -l) )) && hold_pad=0
+                FILTER_PARTS+=("[fs${INPUT_IDX}hold]scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2,tpad=stop_mode=clone:stop_duration=${hold_pad},setpts=(PTS-STARTPTS)*${stretch}+${offset}/TB[v${INPUT_IDX}h]")
                 VLABEL_NARROW[$i]="v${INPUT_IDX}n"
                 VLABEL_WIDE[$i]="v${INPUT_IDX}w"
+                VLABEL_HOLD[$i]="v${INPUT_IDX}h"
                 IS_FS_SOURCE[$i]=1
               else
                 # Not a designated full-frame source (camera, or anything
@@ -780,11 +878,24 @@ jobs:
             done
 
             # Pass 2: composite in the order that actually keeps things
-            # visible - camera full-frame views first (lowest layer;
-            # mutually exclusive in time with the full-frame sources below
-            # by construction, so draw order between them never matters),
-            # then the full-frame sources themselves, then camera corner
-            # TILES last/on top so they're never painted over.
+            # visible - the frozen full-frame HOLD tails first (lowest
+            # layer of all: pure fallback for when nothing else has
+            # anything to show), then camera full-frame views (mutually
+            # exclusive in time with the full-frame sources below by
+            # construction, so draw order between them never matters, and
+            # gated to skip whenever a hold is also eligible so a live
+            # camera always wins over a frozen slate), then the full-frame
+            # sources themselves, then camera corner TILES last/on top so
+            # they're never painted over.
+            for i in "${!C_LOCAL_FILES[@]}"; do
+              [[ "${C_TYPES[$i]}" == "VIDEO" && "${IS_FS_SOURCE[$i]:-}" == "1" ]] || continue
+              hold_dur="${HOLD_DUR[$i]:-0}"
+              (( $(echo "$hold_dur <= 0" | bc -l) )) && continue
+              hold_start=$(echo "${OFFSETS[$i]} + ${STRETCHED_DURATIONS[$i]}" | bc)
+              hold_end="${HOLD_END[$i]:-$hold_start}"
+              FILTER_PARTS+=("[${CUR_LABEL}][${VLABEL_HOLD[$i]}]overlay=enable='between(t,${hold_start},${hold_end})*lte(${CAMERA_VISIBLE_SUM_EXPR},0)'[ovh${i}]")
+              CUR_LABEL="ovh${i}"
+            done
             for i in "${!C_LOCAL_FILES[@]}"; do
               [[ "${C_TYPES[$i]}" == "VIDEO" && "${IS_FS_SOURCE[$i]:-}" == "0" ]] || continue
               FILTER_PARTS+=("[${CUR_LABEL}][${VLABEL_FULL[$i]}]overlay=enable='${ACTIVE_EXPR[$i]}*lte(${FS_SUM_EXPR},0)'[ovf${i}]")
@@ -954,7 +1065,8 @@ jobs:
 
             unset CL_IDX C_LOCAL_FILES C_SOURCES C_TYPES C_STARTS C_ENDS
             unset OFFSETS DURATIONS STRETCH STRETCHED_DURATIONS
-            unset VLABEL_FULL VLABEL_TILE IS_FS_SOURCE TILE_X TILE_Y
+            unset VLABEL_FULL VLABEL_TILE VLABEL_NARROW VLABEL_WIDE VLABEL_HOLD IS_FS_SOURCE TILE_X TILE_Y
+            unset HOLD_END HOLD_DUR FS_IDX_SORTED
           done
 
           # Belt-and-braces final marker advance: MAX_ENDED_SEEN (tracked

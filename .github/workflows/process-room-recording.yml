@@ -560,6 +560,23 @@ jobs:
             # composite frame during a screen-share window and finding no
             # camera tile there at all, even though the tile's own
             # enable/timing logic looked correct on paper.
+            # A screen share/whiteboard used to be scaled to the FULL
+            # 1280x720 canvas, with camera tiles overlaid in a bottom-right
+            # corner on top of it - which meant the tiles could sit right on
+            # top of real content (e.g. the bottom of a shared PDF/slide),
+            # visually interrupting the share. Whenever a full-frame source
+            # is active, it's now confined to a fixed CONTENT BOX on the
+            # left (FS_SPLIT_W wide, full height) and every active camera
+            # renders as a small tile in a dedicated COLUMN on the right
+            # (the remaining 1280-FS_SPLIT_W px) instead - the two regions
+            # never overlap, so a camera tile can never cover any part of
+            # the shared content. This only affects layout while a
+            # full-frame source is actually active; with nothing being
+            # shared, a camera still goes full 1280x720 exactly as before.
+            FS_SPLIT_W=960
+            TILE_COL_X=$FS_SPLIT_W
+            TILE_COL_W=$((1280 - FS_SPLIT_W))
+
             unset VLABEL_FULL VLABEL_TILE IS_FS_SOURCE TILE_X TILE_Y
             declare -A VLABEL_FULL VLABEL_TILE IS_FS_SOURCE TILE_X TILE_Y
             TILE_COUNTER=0
@@ -573,31 +590,43 @@ jobs:
               FFMPEG_INPUTS+=(-itsoffset "$offset" -i "${C_LOCAL_FILES[$i]}")
 
               if [[ "$source_v" == "SCREEN_SHARE" || "$source_v" == "WHITEBOARD" ]]; then
-                FILTER_PARTS+=("[${INPUT_IDX}:v]scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2,setpts=(PTS-STARTPTS)*${stretch}+${offset}/TB[v${INPUT_IDX}]")
+                # Fit into the left content box (FS_SPLIT_W x 720, letterboxed
+                # if its own aspect ratio doesn't match) instead of the full
+                # canvas - the overlay in pass 2 below places this at x=0,y=0
+                # by default, so it never reaches into the tile column.
+                FILTER_PARTS+=("[${INPUT_IDX}:v]scale=${FS_SPLIT_W}:720:force_original_aspect_ratio=decrease,pad=${FS_SPLIT_W}:720:(ow-iw)/2:(oh-ih)/2,setpts=(PTS-STARTPTS)*${stretch}+${offset}/TB[v${INPUT_IDX}]")
                 VLABEL_FULL[$i]="v${INPUT_IDX}"
                 IS_FS_SOURCE[$i]=1
               else
                 # Not a designated full-frame source (camera, or anything
                 # else that lands here): goes full-frame whenever it's
                 # active and nothing else is claiming the full frame at
-                # that moment, and shrinks to a small corner tile only
-                # during the sub-window(s) where it overlaps a genuine
-                # full-frame source (screen share / whiteboard). ffmpeg
-                # can't resize one overlay dynamically, so this needs two
-                # differently-scaled copies of the same input, each gated
-                # by the opposite half of that condition. tile_col comes
-                # from a dedicated counter over camera-like tracks only -
-                # not the raw track index i, which mixes in audio tracks
-                # and would scatter/mis-position tiles as soon as track
-                # ordering shifted (e.g. an extra mic track before a
-                # camera).
-                tile_w=320; tile_h=180; margin=10
-                tile_col=$(( TILE_COUNTER % 4 ))
+                # that moment, and shrinks to a small tile in the right-hand
+                # column only during the sub-window(s) where it overlaps a
+                # genuine full-frame source (screen share / whiteboard).
+                # ffmpeg can't resize one overlay dynamically, so this needs
+                # two differently-scaled copies of the same input, each
+                # gated by the opposite half of that condition. Tiles stack
+                # top-to-bottom (not left-to-right) so they stay inside the
+                # dedicated column and never drift left into the content
+                # box. tile_row comes from a dedicated counter over
+                # camera-like tracks only - not the raw track index i, which
+                # mixes in audio tracks and would scatter/mis-position tiles
+                # as soon as track ordering shifted (e.g. an extra mic track
+                # before a camera). Capped at 4 stacked tiles (fits exactly
+                # within 720px tall at this tile_h/margin); a 5th
+                # simultaneous camera would wrap and overlap a lower tile -
+                # no room realistically expected here has more than 4
+                # cameras on at once.
+                tile_margin=8
+                tile_h=$(( (720 - 5 * tile_margin) / 4 ))
+                tile_w=$(( TILE_COL_W - 10 ))
+                tile_row=$(( TILE_COUNTER % 4 ))
                 TILE_COUNTER=$((TILE_COUNTER + 1))
                 VLABEL_FULL[$i]="v${INPUT_IDX}f"
                 VLABEL_TILE[$i]="v${INPUT_IDX}t"
-                TILE_X[$i]="W-${tile_w}-${margin}-((${tile_col})*(${tile_w}+${margin}))"
-                TILE_Y[$i]="H-${tile_h}-${margin}"
+                TILE_X[$i]="${TILE_COL_X}+5"
+                TILE_Y[$i]="${tile_margin}+((${tile_row})*(${tile_h}+${tile_margin}))"
                 IS_FS_SOURCE[$i]=0
                 FILTER_PARTS+=("[${INPUT_IDX}:v]split=2[cam${INPUT_IDX}tile][cam${INPUT_IDX}full]")
                 FILTER_PARTS+=("[cam${INPUT_IDX}tile]scale=${tile_w}:${tile_h}:force_original_aspect_ratio=decrease,setpts=(PTS-STARTPTS)*${stretch}+${offset}/TB[v${INPUT_IDX}t]")

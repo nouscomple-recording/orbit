@@ -565,47 +565,22 @@ jobs:
             # corner on top of it - which meant the tiles could sit right on
             # top of real content (e.g. the bottom of a shared PDF/slide),
             # visually interrupting the share. Whenever a full-frame source
-            # is active, it's now confined to a fixed CONTENT BOX on the
-            # left (FS_SPLIT_W wide, full height) and every active camera
-            # renders as a small tile in a dedicated COLUMN on the right
-            # (the remaining 1280-FS_SPLIT_W px) instead - the two regions
-            # never overlap, so a camera tile can never cover any part of
-            # the shared content. This only affects layout while a
-            # full-frame source is actually active; with nothing being
-            # shared, a camera still goes full 1280x720 exactly as before.
+            # is active AND a camera is genuinely visible at that same
+            # instant, it's now confined to a fixed CONTENT BOX on the left
+            # (960px wide, full height) and the camera renders as a small
+            # tile in a dedicated COLUMN on the right (the remaining 320px)
+            # instead - the two regions never overlap, so a camera tile can
+            # never cover any part of the shared content.
             #
-            # That reserved column is only worth having if a camera could
-            # ever actually appear in it. A whiteboard-only or
-            # screen-share-only session (no camera track published at all,
-            # e.g. a presenter who never turns their camera on) has nothing
-            # to put there, and reserving it anyway just left a permanent
-            # blank strip painted in the base canvas color with nothing
-            # ever drawn over it - confusingly conspicuous since that color
-            # (0x0e1c76, a dark navy) reads as "video box" blue rather than
-            # a neutral gap. So the column is only reserved when this
-            # session actually contains at least one non-full-frame VIDEO
-            # track (i.e. a real camera); otherwise the full-frame source
-            # gets the entire 1280x720 canvas, same as when nothing is
-            # shared at all. This is decided once per session (not
-            # re-evaluated frame-by-frame) so the layout doesn't jump
-            # around if a camera is briefly toggled off and back on mid-
-            # session - the column, once reserved, stays reserved for the
-            # whole session even through a brief camera drop.
-            HAS_CAMERA_TRACK=0
-            for i in "${!C_LOCAL_FILES[@]}"; do
-              if [[ "${C_TYPES[$i]}" == "VIDEO" && "${C_SOURCES[$i]}" != "SCREEN_SHARE" && "${C_SOURCES[$i]}" != "WHITEBOARD" ]]; then
-                HAS_CAMERA_TRACK=1
-                break
-              fi
-            done
-
-            if [[ "$HAS_CAMERA_TRACK" -eq 1 ]]; then
-              FS_SPLIT_W=960
-            else
-              FS_SPLIT_W=1280
-            fi
-            TILE_COL_X=$FS_SPLIT_W
-            TILE_COL_W=$((1280 - FS_SPLIT_W))
+            # That column is only worth reserving if a camera could
+            # actually appear in it right now - see CAMERA_VISIBLE_SUM_EXPR
+            # further below for the full reasoning and how that's decided.
+            # The column is only ever drawn into when a camera tile is
+            # actually being placed there (the "else" branch of the Pass 1
+            # loop below), which only happens for a genuine camera-like
+            # track - so these themselves can just be fixed constants.
+            TILE_COL_X=960
+            TILE_COL_W=$((1280 - TILE_COL_X))
 
             # ---- Detect within-track freezes on camera-like tracks ----
             #
@@ -711,8 +686,36 @@ jobs:
               unset FREEZE_STARTS FREEZE_ENDS TERMS
             done
 
-            unset VLABEL_FULL VLABEL_TILE IS_FS_SOURCE TILE_X TILE_Y
-            declare -A VLABEL_FULL VLABEL_TILE IS_FS_SOURCE TILE_X TILE_Y
+            # Whenever no camera is genuinely visible right now - because
+            # this session never had one, the presenter has it switched
+            # off at this instant, or it's currently in a detected freeze -
+            # there's no camera column to keep clear, so a whiteboard/
+            # screen-share should use the entire 1280x720 canvas instead of
+            # being confined to the narrower 960 content box. This is a
+            # deliberate change from treating that as a one-time
+            # per-session decision: reserving the column for an entire
+            # session just because a camera was on for a moment (or is
+            # frozen and effectively invisible) left a permanent, unused
+            # navy strip next to full-width content the rest of the time -
+            # exactly what was reported. The trade-off is that the layout
+            # can now visibly resize whenever the presenter's camera
+            # actually toggles, which is judged the lesser issue versus
+            # wasting a quarter of the frame on an empty column.
+            declare -a CAMERA_VISIBLE_TERMS=()
+            for i in "${!C_LOCAL_FILES[@]}"; do
+              [[ "${C_TYPES[$i]}" == "VIDEO" ]] || continue
+              [[ "${C_SOURCES[$i]}" == "SCREEN_SHARE" || "${C_SOURCES[$i]}" == "WHITEBOARD" ]] && continue
+              CAMERA_VISIBLE_TERMS+=("${ACTIVE_EXPR[$i]}")
+            done
+            if [[ "${#CAMERA_VISIBLE_TERMS[@]}" -eq 0 ]]; then
+              CAMERA_VISIBLE_SUM_EXPR="0"
+            else
+              CAMERA_VISIBLE_SUM_EXPR=$(IFS='+'; echo "${CAMERA_VISIBLE_TERMS[*]}")
+            fi
+            log "session $cluster_num camera-visible-now expression: $CAMERA_VISIBLE_SUM_EXPR"
+
+            unset VLABEL_FULL VLABEL_TILE VLABEL_NARROW VLABEL_WIDE IS_FS_SOURCE TILE_X TILE_Y
+            declare -A VLABEL_FULL VLABEL_TILE VLABEL_NARROW VLABEL_WIDE IS_FS_SOURCE TILE_X TILE_Y
             TILE_COUNTER=0
             for i in "${!C_LOCAL_FILES[@]}"; do
               type_v="${C_TYPES[$i]}"
@@ -724,12 +727,19 @@ jobs:
               FFMPEG_INPUTS+=(-itsoffset "$offset" -i "${C_LOCAL_FILES[$i]}")
 
               if [[ "$source_v" == "SCREEN_SHARE" || "$source_v" == "WHITEBOARD" ]]; then
-                # Fit into the left content box (FS_SPLIT_W x 720, letterboxed
-                # if its own aspect ratio doesn't match) instead of the full
-                # canvas - the overlay in pass 2 below places this at x=0,y=0
-                # by default, so it never reaches into the tile column.
-                FILTER_PARTS+=("[${INPUT_IDX}:v]scale=${FS_SPLIT_W}:720:force_original_aspect_ratio=decrease,pad=${FS_SPLIT_W}:720:(ow-iw)/2:(oh-ih)/2,setpts=(PTS-STARTPTS)*${stretch}+${offset}/TB[v${INPUT_IDX}]")
-                VLABEL_FULL[$i]="v${INPUT_IDX}"
+                # Two differently-scaled copies of the same source, same
+                # technique as the camera full/tile split below: a narrow
+                # one (960x720) for instants when a camera is genuinely
+                # visible and needs its column left clear, and a wide one
+                # (1280x720, the full canvas) for instants when it isn't.
+                # Pass 2 below picks whichever one actually applies at each
+                # moment via CAMERA_VISIBLE_SUM_EXPR - this only prepares
+                # both; it doesn't decide between them.
+                FILTER_PARTS+=("[${INPUT_IDX}:v]split=2[fs${INPUT_IDX}narrow][fs${INPUT_IDX}wide]")
+                FILTER_PARTS+=("[fs${INPUT_IDX}narrow]scale=${TILE_COL_X}:720:force_original_aspect_ratio=decrease,pad=${TILE_COL_X}:720:(ow-iw)/2:(oh-ih)/2,setpts=(PTS-STARTPTS)*${stretch}+${offset}/TB[v${INPUT_IDX}n]")
+                FILTER_PARTS+=("[fs${INPUT_IDX}wide]scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2,setpts=(PTS-STARTPTS)*${stretch}+${offset}/TB[v${INPUT_IDX}w]")
+                VLABEL_NARROW[$i]="v${INPUT_IDX}n"
+                VLABEL_WIDE[$i]="v${INPUT_IDX}w"
                 IS_FS_SOURCE[$i]=1
               else
                 # Not a designated full-frame source (camera, or anything
@@ -784,8 +794,15 @@ jobs:
               [[ "${C_TYPES[$i]}" == "VIDEO" && "${IS_FS_SOURCE[$i]:-}" == "1" ]] || continue
               offset="${OFFSETS[$i]}"
               end=$(echo "$offset + ${STRETCHED_DURATIONS[$i]}" | bc)
-              FILTER_PARTS+=("[${CUR_LABEL}][${VLABEL_FULL[$i]}]overlay=enable='between(t,${offset},${end})'[ovs${i}]")
-              CUR_LABEL="ovs${i}"
+              # Mutually exclusive by construction (gt/lte on the same
+              # expression), so draw order between narrow and wide never
+              # matters - and neither can ever coincide with this track's
+              # own camera tile below, since any camera tile being active
+              # necessarily makes CAMERA_VISIBLE_SUM_EXPR > 0 too.
+              FILTER_PARTS+=("[${CUR_LABEL}][${VLABEL_NARROW[$i]}]overlay=enable='between(t,${offset},${end})*gt(${CAMERA_VISIBLE_SUM_EXPR},0)'[ovsn${i}]")
+              CUR_LABEL="ovsn${i}"
+              FILTER_PARTS+=("[${CUR_LABEL}][${VLABEL_WIDE[$i]}]overlay=enable='between(t,${offset},${end})*lte(${CAMERA_VISIBLE_SUM_EXPR},0)'[ovsw${i}]")
+              CUR_LABEL="ovsw${i}"
             done
             for i in "${!C_LOCAL_FILES[@]}"; do
               [[ "${C_TYPES[$i]}" == "VIDEO" && "${IS_FS_SOURCE[$i]:-}" == "0" ]] || continue

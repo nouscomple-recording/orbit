@@ -607,6 +607,110 @@ jobs:
             TILE_COL_X=$FS_SPLIT_W
             TILE_COL_W=$((1280 - FS_SPLIT_W))
 
+            # ---- Detect within-track freezes on camera-like tracks ----
+            #
+            # A track's [offset, offset+duration] window was always treated
+            # as continuously live for its whole span. That's wrong when a
+            # participant disables their camera without LiveKit actually
+            # ending the egress track: the recording just keeps going with
+            # whatever the last real frame was repeated for however long
+            # the camera stays off (confirmed independently by ffmpeg's own
+            # "More than N frames duplicated" warning seen in practice when
+            # normalizing such a file to constant fps), and the composite
+            # then shows that stale frame as if it were live video - a
+            # static "photo" sitting in the corner tile or full-frame view
+            # for however long the freeze lasts, not a blank/no-camera
+            # state. This detection is deliberately ONLY applied to
+            # camera-like tracks, never to SCREEN_SHARE/WHITEBOARD ones: a
+            # presenter not actively drawing or scrolling for a while is
+            # normal, expected stillness, not a bug, and hiding a merely-
+            # quiet screen share would itself be wrong.
+            #
+            # ACTIVE_EXPR[i] holds the ffmpeg boolean expression (in terms
+            # of `t`, the global composite timeline) for when this track
+            # should actually be shown. It defaults to the original plain
+            # between(offset,end) whenever no freeze is found, so a track
+            # with no freeze behaves exactly as before this change.
+            FREEZE_MIN_SECONDS=3
+            declare -a ACTIVE_EXPR=()
+            for i in "${!C_LOCAL_FILES[@]}"; do
+              [[ "${C_TYPES[$i]}" == "VIDEO" ]] || continue
+              [[ "${C_SOURCES[$i]}" == "SCREEN_SHARE" || "${C_SOURCES[$i]}" == "WHITEBOARD" ]] && continue
+
+              f="${C_LOCAL_FILES[$i]}"
+              offset="${OFFSETS[$i]}"
+              stretch="${STRETCH[$i]}"
+              dur="${DURATIONS[$i]}"
+              default_end=$(echo "$offset + ${STRETCHED_DURATIONS[$i]}" | bc)
+              ACTIVE_EXPR[$i]="between(t,${offset},${default_end})"
+
+              if [[ -z "$dur" ]] || (( $(echo "$dur <= 0" | bc -l) )); then
+                continue
+              fi
+
+              FREEZE_LOG="${WORKDIR}/freezedetect_${cluster_num}_${i}.log"
+              ffmpeg -hide_banner -nostats -nostdin -i "$f" \
+                -vf "freezedetect=n=-60dB:d=${FREEZE_MIN_SECONDS}" -an -f null - \
+                > "$FREEZE_LOG" 2>&1 </dev/null || true
+
+              declare -a FREEZE_STARTS=() FREEZE_ENDS=()
+              while IFS= read -r fzline; do
+                if [[ "$fzline" =~ freeze_start:\ ([0-9.]+) ]]; then
+                  FREEZE_STARTS+=("${BASH_REMATCH[1]}")
+                elif [[ "$fzline" =~ freeze_end:\ ([0-9.]+) ]]; then
+                  FREEZE_ENDS+=("${BASH_REMATCH[1]}")
+                fi
+              done < "$FREEZE_LOG"
+
+              if [[ "${#FREEZE_STARTS[@]}" -eq 0 ]]; then
+                unset FREEZE_STARTS FREEZE_ENDS
+                continue
+              fi
+
+              # A freeze still ongoing when the file ends emits a
+              # freeze_start with no matching freeze_end - treat that as
+              # frozen through the end of the track's own duration.
+              while [[ "${#FREEZE_ENDS[@]}" -lt "${#FREEZE_STARTS[@]}" ]]; do
+                FREEZE_ENDS+=("$dur")
+              done
+
+              log "session $cluster_num track[$i] source=${C_SOURCES[$i]}: ${#FREEZE_STARTS[@]} freeze period(s) detected (>=${FREEZE_MIN_SECONDS}s each) - will be hidden instead of shown as a static frame"
+
+              # Walk local (pre-stretch) track time from 0 to dur, cut out
+              # each detected [freeze_start,freeze_end) window, and convert
+              # each surviving live sub-range into global composite-
+              # timeline time the same way the rest of this script already
+              # does for the track as a whole (multiply by its own drift-
+              # correction stretch factor, then add its offset).
+              declare -a TERMS=()
+              cursor="0"
+              for fi in "${!FREEZE_STARTS[@]}"; do
+                fs="${FREEZE_STARTS[$fi]}"
+                fe="${FREEZE_ENDS[$fi]}"
+                if (( $(echo "$fs > $cursor" | bc -l) )); then
+                  g_start=$(echo "$cursor * $stretch + $offset" | bc)
+                  g_end=$(echo "$fs * $stretch + $offset" | bc)
+                  TERMS+=("between(t,${g_start},${g_end})")
+                fi
+                cursor="$fe"
+              done
+              if (( $(echo "$cursor < $dur" | bc -l) )); then
+                g_start=$(echo "$cursor * $stretch + $offset" | bc)
+                g_end=$(echo "$dur * $stretch + $offset" | bc)
+                TERMS+=("between(t,${g_start},${g_end})")
+              fi
+
+              if [[ "${#TERMS[@]}" -eq 0 ]]; then
+                # Frozen for its entire duration - never actually active.
+                ACTIVE_EXPR[$i]="0"
+              else
+                active_sum=$(IFS='+'; echo "${TERMS[*]}")
+                ACTIVE_EXPR[$i]="gt(${active_sum},0)"
+              fi
+
+              unset FREEZE_STARTS FREEZE_ENDS TERMS
+            done
+
             unset VLABEL_FULL VLABEL_TILE IS_FS_SOURCE TILE_X TILE_Y
             declare -A VLABEL_FULL VLABEL_TILE IS_FS_SOURCE TILE_X TILE_Y
             TILE_COUNTER=0
@@ -673,9 +777,7 @@ jobs:
             # TILES last/on top so they're never painted over.
             for i in "${!C_LOCAL_FILES[@]}"; do
               [[ "${C_TYPES[$i]}" == "VIDEO" && "${IS_FS_SOURCE[$i]:-}" == "0" ]] || continue
-              offset="${OFFSETS[$i]}"
-              end=$(echo "$offset + ${STRETCHED_DURATIONS[$i]}" | bc)
-              FILTER_PARTS+=("[${CUR_LABEL}][${VLABEL_FULL[$i]}]overlay=enable='between(t,${offset},${end})*lte(${FS_SUM_EXPR},0)'[ovf${i}]")
+              FILTER_PARTS+=("[${CUR_LABEL}][${VLABEL_FULL[$i]}]overlay=enable='${ACTIVE_EXPR[$i]}*lte(${FS_SUM_EXPR},0)'[ovf${i}]")
               CUR_LABEL="ovf${i}"
             done
             for i in "${!C_LOCAL_FILES[@]}"; do
@@ -687,9 +789,7 @@ jobs:
             done
             for i in "${!C_LOCAL_FILES[@]}"; do
               [[ "${C_TYPES[$i]}" == "VIDEO" && "${IS_FS_SOURCE[$i]:-}" == "0" ]] || continue
-              offset="${OFFSETS[$i]}"
-              end=$(echo "$offset + ${STRETCHED_DURATIONS[$i]}" | bc)
-              FILTER_PARTS+=("[${CUR_LABEL}][${VLABEL_TILE[$i]}]overlay=x='${TILE_X[$i]}':y='${TILE_Y[$i]}':enable='between(t,${offset},${end})*gt(${FS_SUM_EXPR},0)'[ovt${i}]")
+              FILTER_PARTS+=("[${CUR_LABEL}][${VLABEL_TILE[$i]}]overlay=x='${TILE_X[$i]}':y='${TILE_Y[$i]}':enable='${ACTIVE_EXPR[$i]}*gt(${FS_SUM_EXPR},0)'[ovt${i}]")
               CUR_LABEL="ovt${i}"
             done
             FINAL_VIDEO_LABEL="$CUR_LABEL"

@@ -227,6 +227,25 @@ jobs:
             echo "$chain"
           }
 
+          # bc prints a fraction under 1 with no leading digit before the
+          # decimal point (e.g. ".506006", or "-.5"), which is perfectly
+          # valid to bc itself and to ffmpeg filter expressions like
+          # between(t,.5,1) - but ffmpeg's *duration*-typed CLI/filter
+          # options (-itsoffset, tpad's stop_duration, -t, etc.) are parsed
+          # with the stricter av_parse_time, which rejects a bare leading
+          # dot outright ("Unable to parse option value ... as duration"),
+          # aborting the whole ffmpeg run with no composite produced at
+          # all. Anywhere a bc result feeds one of those options, it has to
+          # go through this first.
+          fix_duration_leading_zero() {
+            local v="$1"
+            case "$v" in
+              .*) echo "0${v}" ;;
+              -.*) echo "-0${v#-}" ;;
+              *) echo "$v" ;;
+            esac
+          }
+
           declare -a RAW_KEYS=()
           declare -a LOCAL_FILES=()
           declare -a SOURCES=()
@@ -445,6 +464,10 @@ jobs:
               [[ -z "$dur" || "$dur" == "N/A" ]] && dur=0
               offset=$(echo "${C_STARTS[$i]} - $EARLIEST_START" | bc)
               (( $(echo "$offset < 0" | bc -l) )) && offset=0
+              # This feeds -itsoffset (a duration-typed ffmpeg option)
+              # further below, in addition to plain filter-expression use -
+              # see fix_duration_leading_zero above.
+              offset=$(fix_duration_leading_zero "$offset")
               OFFSETS+=("$offset")
               DURATIONS+=("$dur")
 
@@ -834,6 +857,9 @@ jobs:
                 hold_dur_raw="${HOLD_DUR[$i]:-0}"
                 hold_pad=$(echo "scale=6; $hold_dur_raw / $stretch" | bc)
                 (( $(echo "$hold_pad < 0" | bc -l) )) && hold_pad=0
+                # tpad's stop_duration is a duration-typed ffmpeg option -
+                # see fix_duration_leading_zero above.
+                hold_pad=$(fix_duration_leading_zero "$hold_pad")
                 FILTER_PARTS+=("[fs${INPUT_IDX}hold]scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2,tpad=stop_mode=clone:stop_duration=${hold_pad},setpts=(PTS-STARTPTS)*${stretch}+${offset}/TB[v${INPUT_IDX}h]")
                 VLABEL_NARROW[$i]="v${INPUT_IDX}n"
                 VLABEL_WIDE[$i]="v${INPUT_IDX}w"

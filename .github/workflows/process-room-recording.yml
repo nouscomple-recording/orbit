@@ -573,7 +573,37 @@ jobs:
             # the shared content. This only affects layout while a
             # full-frame source is actually active; with nothing being
             # shared, a camera still goes full 1280x720 exactly as before.
-            FS_SPLIT_W=960
+            #
+            # That reserved column is only worth having if a camera could
+            # ever actually appear in it. A whiteboard-only or
+            # screen-share-only session (no camera track published at all,
+            # e.g. a presenter who never turns their camera on) has nothing
+            # to put there, and reserving it anyway just left a permanent
+            # blank strip painted in the base canvas color with nothing
+            # ever drawn over it - confusingly conspicuous since that color
+            # (0x0e1c76, a dark navy) reads as "video box" blue rather than
+            # a neutral gap. So the column is only reserved when this
+            # session actually contains at least one non-full-frame VIDEO
+            # track (i.e. a real camera); otherwise the full-frame source
+            # gets the entire 1280x720 canvas, same as when nothing is
+            # shared at all. This is decided once per session (not
+            # re-evaluated frame-by-frame) so the layout doesn't jump
+            # around if a camera is briefly toggled off and back on mid-
+            # session - the column, once reserved, stays reserved for the
+            # whole session even through a brief camera drop.
+            HAS_CAMERA_TRACK=0
+            for i in "${!C_LOCAL_FILES[@]}"; do
+              if [[ "${C_TYPES[$i]}" == "VIDEO" && "${C_SOURCES[$i]}" != "SCREEN_SHARE" && "${C_SOURCES[$i]}" != "WHITEBOARD" ]]; then
+                HAS_CAMERA_TRACK=1
+                break
+              fi
+            done
+
+            if [[ "$HAS_CAMERA_TRACK" -eq 1 ]]; then
+              FS_SPLIT_W=960
+            else
+              FS_SPLIT_W=1280
+            fi
             TILE_COL_X=$FS_SPLIT_W
             TILE_COL_W=$((1280 - FS_SPLIT_W))
 

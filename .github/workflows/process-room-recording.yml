@@ -358,334 +358,444 @@ jobs:
             exit 0
           fi
 
-          EARLIEST_START="${STARTS[0]}"
-          for s in "${STARTS[@]}"; do
-            if (( $(echo "$s < $EARLIEST_START" | bc -l) )); then EARLIEST_START="$s"; fi
-          done
-          log "sync anchor (earliest track start): $EARLIEST_START"
+          # ---- Split the surviving items back into distinct sessions ----
+          # LiveKit's ListEgress returns every egress job ever run for this
+          # room NAME, and the marker above only stops us reprocessing
+          # tracks a PREVIOUS successful run already finished - it does
+          # nothing about tracks that are new to this run but actually
+          # belong to several different, unrelated recordings that happened
+          # to share a room name before this pipeline ever ran against it
+          # (a genuinely recurring/weekly room, or a backlog of short test
+          # recordings that piled up while earlier bugs here were being
+          # fixed). Confirmed directly causing a real bug: a ~2 minute
+          # meeting came out as a ~39 minute video because 14 egress jobs
+          # from 4 unrelated recordings, spanning almost 40 minutes of
+          # wall-clock time with multi-minute gaps between them, all got
+          # merged into one timeline. Clustering by gap size splits them
+          # back into their true sessions and produces one correctly-scoped
+          # output per session instead of one bogus combined one - this is
+          # NOT a rare edge case: it is exactly what happens the very first
+          # time this marker-based code ever runs against any room that
+          # already has unprocessed history sitting in LiveKit.
+          SESSION_GAP_SECONDS=240
 
-          FFMPEG_INPUTS=()
-          FILTER_PARTS=()
-          TOTAL_DURATION=0
-          INPUT_IDX=1
-
-          declare -a OFFSETS=()
-          declare -a DURATIONS=()
-          declare -a STRETCH=()
-          declare -a STRETCHED_DURATIONS=()
+          : > "${WORKDIR}/sortable_starts.txt"
           for i in "${!LOCAL_FILES[@]}"; do
-            f="${LOCAL_FILES[$i]}"
-            dur=$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$f" 2>/dev/null || echo 0)
-            [[ -z "$dur" || "$dur" == "N/A" ]] && dur=0
-            offset=$(echo "${STARTS[$i]} - $EARLIEST_START" | bc)
-            (( $(echo "$offset < 0" | bc -l) )) && offset=0
-            OFFSETS+=("$offset")
-            DURATIONS+=("$dur")
+            printf '%s\t%s\n' "${STARTS[$i]}" "$i" >> "${WORKDIR}/sortable_starts.txt"
+          done
+          sort -n -k1,1 "${WORKDIR}/sortable_starts.txt" > "${WORKDIR}/sorted_starts.txt"
 
-            # Compare this track's PROBED file duration against how much
-            # real wall-clock time LiveKit says actually elapsed between
-            # started_at and ended_at for this egress job. When a track's
-            # encoder stalled/dropped frames under CPU or bandwidth pressure
-            # (e.g. camera + whiteboard + screen share + mic all streaming
-            # from one machine at once), its file ends up covering only a
-            # fraction of the real time it was recorded over - exactly what
-            # produces audio/video drift, even though this track's *start*
-            # is aligned correctly. STRETCH[i] is the correction: how much to
-            # linearly stretch this track's own internal timeline so it
-            # occupies its true wall-clock span instead of a compressed one.
-            # STRETCHED_DURATIONS[i] is what that track will actually occupy
-            # in the final composite once that correction is applied, and is
-            # what everything downstream (total duration, overlay enable
-            # windows, the full-frame-active expression) must use instead of
-            # the raw probed duration.
-            wall_span_note=""
-            stretch_factor="1"
-            # Below this, a track is too short for the drift% to mean
-            # anything: LiveKit's own start/stop bookkeeping overhead (job
-            # spin-up/teardown, timestamp rounding) is typically a second or
-            # more, so on a sub-3s clip that overhead alone can look like a
-            # huge "drift" percentage even though nothing actually stalled.
-            # Stretching a clip that short by the resulting extreme factor
-            # (seen in practice: a 0.742s screen-share clip clamped to a 3x
-            # slowdown) is far more noticeable/jarring - a visible
-            # freeze-then-lurch - than the sub-second timing error it's
-            # supposedly fixing, so these are left uncorrected on purpose.
-            MIN_DRIFT_CORRECTION_DURATION=3
-            if [[ "${ENDS[$i]}" != "0" && "${STARTS[$i]}" != "0" ]]; then
-              wall_span=$(echo "${ENDS[$i]} - ${STARTS[$i]}" | bc)
-              if (( $(echo "$wall_span > 0" | bc -l) )) && (( $(echo "$dur > 0" | bc -l) )); then
-                drift_pct=$(echo "scale=2; (($dur - $wall_span) / $wall_span) * 100" | bc)
-                wall_span_note=" wall_span=${wall_span}s drift=${drift_pct}%"
-                if (( $(echo "$dur < $MIN_DRIFT_CORRECTION_DURATION" | bc -l) )) || (( $(echo "$wall_span < $MIN_DRIFT_CORRECTION_DURATION" | bc -l) )); then
-                  wall_span_note="${wall_span_note} <-- drift ignored: track too short (<${MIN_DRIFT_CORRECTION_DURATION}s) for a reliable drift estimate"
-                # Only correct drift that's actually worth correcting - a
-                # difference this small is more likely LiveKit timestamp
-                # rounding/noise than real drift, and resampling a track
-                # that doesn't need it only risks a small quality loss for
-                # no sync benefit. stretch_factor stays "1" (no-op) below
-                # this threshold.
-                elif (( $(echo "${drift_pct#-} > 3" | bc -l) )); then
-                  raw_factor=$(echo "scale=6; $wall_span / $dur" | bc)
-                  # Clamp to a sane range - a ratio this extreme more likely
-                  # means bad/missing metadata than real drift, and blindly
-                  # correcting for it would do more damage than the drift.
-                  clamped_factor="$raw_factor"
-                  (( $(echo "$clamped_factor > 3.0" | bc -l) )) && clamped_factor="3.0"
-                  (( $(echo "$clamped_factor < 0.33" | bc -l) )) && clamped_factor="0.33"
-                  stretch_factor="$clamped_factor"
-                  wall_span_note="${wall_span_note} <-- drift detected, applying stretch factor ${stretch_factor}"
+          declare -a CLUSTER_OF=()
+          CLUSTER_COUNT=0
+          CLUSTER_RUNNING_END=""
+          while IFS=$'\t' read -r s_val idx; do
+            if [[ -z "$CLUSTER_RUNNING_END" ]] || (( $(echo "$s_val - $CLUSTER_RUNNING_END > $SESSION_GAP_SECONDS" | bc -l) )); then
+              CLUSTER_COUNT=$((CLUSTER_COUNT + 1))
+              CLUSTER_RUNNING_END=""
+            fi
+            CLUSTER_OF[$idx]=$CLUSTER_COUNT
+            this_end="${ENDS[$idx]}"
+            [[ "$this_end" == "0" ]] && this_end="$s_val"
+            if [[ -z "$CLUSTER_RUNNING_END" ]] || (( $(echo "$this_end > $CLUSTER_RUNNING_END" | bc -l) )); then
+              CLUSTER_RUNNING_END="$this_end"
+            fi
+          done < "${WORKDIR}/sorted_starts.txt"
+          log "split ${#LOCAL_FILES[@]} surviving track(s) into $CLUSTER_COUNT distinct session(s) (gap threshold ${SESSION_GAP_SECONDS}s)"
+
+          # This ratchets up after each session below finishes uploading and
+          # registering successfully, and is what actually gets written to
+          # R2 as the new marker for each session - so if session 2 of 3
+          # fails, session 1's marker advance already happened and a retry
+          # of this workflow run will not re-upload/re-register it a second
+          # time; only sessions 2 and 3 get retried.
+          MARKER_FLOOR="$LAST_PROCESSED_ENDED_AT"
+          OUTPUT_SUMMARY=()
+
+          for (( cluster_num=1; cluster_num<=CLUSTER_COUNT; cluster_num++ )); do
+            declare -a CL_IDX=()
+            for i in "${!LOCAL_FILES[@]}"; do
+              [[ "${CLUSTER_OF[$i]}" == "$cluster_num" ]] && CL_IDX+=("$i")
+            done
+
+            declare -a C_LOCAL_FILES=() C_SOURCES=() C_TYPES=() C_STARTS=() C_ENDS=()
+            for i in "${CL_IDX[@]}"; do
+              C_LOCAL_FILES+=("${LOCAL_FILES[$i]}")
+              C_SOURCES+=("${SOURCES[$i]}")
+              C_TYPES+=("${TYPES[$i]}")
+              C_STARTS+=("${STARTS[$i]}")
+              C_ENDS+=("${ENDS[$i]}")
+            done
+            log "---- session $cluster_num/$CLUSTER_COUNT: ${#C_LOCAL_FILES[@]} track(s) ----"
+
+            EARLIEST_START="${C_STARTS[0]}"
+            for s in "${C_STARTS[@]}"; do
+              if (( $(echo "$s < $EARLIEST_START" | bc -l) )); then EARLIEST_START="$s"; fi
+            done
+            log "session $cluster_num sync anchor (earliest track start): $EARLIEST_START"
+
+            FFMPEG_INPUTS=()
+            FILTER_PARTS=()
+            TOTAL_DURATION=0
+            INPUT_IDX=1
+
+            declare -a OFFSETS=() DURATIONS=() STRETCH=() STRETCHED_DURATIONS=()
+            for i in "${!C_LOCAL_FILES[@]}"; do
+              f="${C_LOCAL_FILES[$i]}"
+              dur=$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$f" 2>/dev/null || echo 0)
+              [[ -z "$dur" || "$dur" == "N/A" ]] && dur=0
+              offset=$(echo "${C_STARTS[$i]} - $EARLIEST_START" | bc)
+              (( $(echo "$offset < 0" | bc -l) )) && offset=0
+              OFFSETS+=("$offset")
+              DURATIONS+=("$dur")
+
+              # Compare this track's PROBED file duration against how much
+              # real wall-clock time LiveKit says actually elapsed between
+              # started_at and ended_at for this egress job. When a track's
+              # encoder stalled/dropped frames under CPU or bandwidth
+              # pressure (e.g. camera + whiteboard + screen share + mic all
+              # streaming from one machine at once), its file ends up
+              # covering only a fraction of the real time it was recorded
+              # over - exactly what produces audio/video drift, even though
+              # this track's *start* is aligned correctly. STRETCH[i] is the
+              # correction: how much to linearly stretch this track's own
+              # internal timeline so it occupies its true wall-clock span
+              # instead of a compressed one. STRETCHED_DURATIONS[i] is what
+              # that track will actually occupy in the final composite once
+              # that correction is applied, and is what everything
+              # downstream (total duration, overlay enable windows, the
+              # full-frame-active expression) must use instead of the raw
+              # probed duration.
+              wall_span_note=""
+              stretch_factor="1"
+              # Below this, a track is too short for the drift% to mean
+              # anything: LiveKit's own start/stop bookkeeping overhead (job
+              # spin-up/teardown, timestamp rounding) is typically a second
+              # or more, so on a sub-3s clip that overhead alone can look
+              # like a huge "drift" percentage even though nothing actually
+              # stalled. Stretching a clip that short by the resulting
+              # extreme factor (seen in practice: a 0.742s screen-share clip
+              # clamped to a 3x slowdown) is far more noticeable/jarring - a
+              # visible freeze-then-lurch - than the sub-second timing error
+              # it's supposedly fixing, so these are left uncorrected on
+              # purpose.
+              MIN_DRIFT_CORRECTION_DURATION=3
+              if [[ "${C_ENDS[$i]}" != "0" && "${C_STARTS[$i]}" != "0" ]]; then
+                wall_span=$(echo "${C_ENDS[$i]} - ${C_STARTS[$i]}" | bc)
+                if (( $(echo "$wall_span > 0" | bc -l) )) && (( $(echo "$dur > 0" | bc -l) )); then
+                  drift_pct=$(echo "scale=2; (($dur - $wall_span) / $wall_span) * 100" | bc)
+                  wall_span_note=" wall_span=${wall_span}s drift=${drift_pct}%"
+                  if (( $(echo "$dur < $MIN_DRIFT_CORRECTION_DURATION" | bc -l) )) || (( $(echo "$wall_span < $MIN_DRIFT_CORRECTION_DURATION" | bc -l) )); then
+                    wall_span_note="${wall_span_note} <-- drift ignored: track too short (<${MIN_DRIFT_CORRECTION_DURATION}s) for a reliable drift estimate"
+                  # Only correct drift that's actually worth correcting - a
+                  # difference this small is more likely LiveKit timestamp
+                  # rounding/noise than real drift, and resampling a track
+                  # that doesn't need it only risks a small quality loss for
+                  # no sync benefit. stretch_factor stays "1" (no-op) below
+                  # this threshold.
+                  elif (( $(echo "${drift_pct#-} > 3" | bc -l) )); then
+                    raw_factor=$(echo "scale=6; $wall_span / $dur" | bc)
+                    # Clamp to a sane range - a ratio this extreme more
+                    # likely means bad/missing metadata than real drift, and
+                    # blindly correcting for it would do more damage than
+                    # the drift.
+                    clamped_factor="$raw_factor"
+                    (( $(echo "$clamped_factor > 3.0" | bc -l) )) && clamped_factor="3.0"
+                    (( $(echo "$clamped_factor < 0.33" | bc -l) )) && clamped_factor="0.33"
+                    stretch_factor="$clamped_factor"
+                    wall_span_note="${wall_span_note} <-- drift detected, applying stretch factor ${stretch_factor}"
+                  fi
                 fi
-              fi
-            else
-              wall_span_note=" wall_span=unavailable(no ended_at from LiveKit)"
-            fi
-            STRETCH+=("$stretch_factor")
-            stretched_dur=$(echo "scale=6; $dur * $stretch_factor" | bc)
-            STRETCHED_DURATIONS+=("$stretched_dur")
-
-            end=$(echo "$offset + $stretched_dur" | bc)
-            if (( $(echo "$end > $TOTAL_DURATION" | bc -l) )); then TOTAL_DURATION="$end"; fi
-
-            log "track[$i] source=${SOURCES[$i]} type=${TYPES[$i]} offset=${offset}s duration=${dur}s${wall_span_note}"
-          done
-          TOTAL_DURATION=$(echo "($TOTAL_DURATION + 2) / 1" | bc)
-          [[ "$TOTAL_DURATION" -lt 1 ]] && TOTAL_DURATION=5
-          log "total composed duration: ${TOTAL_DURATION}s"
-
-          # Pre-pass: collect every SCREEN_SHARE/WHITEBOARD ("full-frame")
-          # video track's own active window (using its STRETCHED duration,
-          # since that's how long it actually plays in the composite), so
-          # any OTHER video track (in practice: camera) can tell, at any
-          # moment t, whether something else already legitimately owns the
-          # full frame. FS_SUM_EXPR evaluates to >0 at any instant when at
-          # least one full-frame source is active, 0 otherwise (0
-          # permanently if there are no full-frame sources in this room).
-          FS_TERMS=()
-          for i in "${!LOCAL_FILES[@]}"; do
-            if [[ "${TYPES[$i]}" == "VIDEO" && ( "${SOURCES[$i]}" == "SCREEN_SHARE" || "${SOURCES[$i]}" == "WHITEBOARD" ) ]]; then
-              fs_offset="${OFFSETS[$i]}"
-              fs_end=$(echo "${OFFSETS[$i]} + ${STRETCHED_DURATIONS[$i]}" | bc)
-              FS_TERMS+=("between(t,${fs_offset},${fs_end})")
-            fi
-          done
-          if [[ "${#FS_TERMS[@]}" -eq 0 ]]; then
-            FS_SUM_EXPR="0"
-          else
-            FS_SUM_EXPR=$(IFS='+'; echo "${FS_TERMS[*]}")
-          fi
-          log "full-frame-active expression: $FS_SUM_EXPR"
-
-          FFMPEG_INPUTS+=(-f lavfi -i "color=c=0x0e1c76:s=1280x720:r=30:d=${TOTAL_DURATION}")
-          CUR_LABEL="0:v"
-
-          # Pass 1: register each video track's ffmpeg input and its
-          # scale/split filter stage(s) only - no compositing (overlay) yet.
-          # Compositing order matters and is handled separately in pass 2
-          # below, because a full-frame source (screen share/whiteboard) is
-          # fully opaque: if a camera's small corner TILE were drawn onto
-          # the canvas *before* the full-frame source, the full-frame layer
-          # drawn on top afterwards would completely paint over it and the
-          # tile would never actually be visible - exactly the bug found by
-          # inspecting a real composite frame during a screen-share window
-          # and finding no camera tile there at all, even though the tile's
-          # own enable/timing logic looked correct on paper.
-          declare -A VLABEL_FULL VLABEL_TILE IS_FS_SOURCE TILE_X TILE_Y
-          TILE_COUNTER=0
-          for i in "${!LOCAL_FILES[@]}"; do
-            type_v="${TYPES[$i]}"
-            source_v="${SOURCES[$i]}"
-            [[ "$type_v" == "VIDEO" ]] || continue
-
-            offset="${OFFSETS[$i]}"
-            stretch="${STRETCH[$i]}"
-            FFMPEG_INPUTS+=(-itsoffset "$offset" -i "${LOCAL_FILES[$i]}")
-
-            if [[ "$source_v" == "SCREEN_SHARE" || "$source_v" == "WHITEBOARD" ]]; then
-              FILTER_PARTS+=("[${INPUT_IDX}:v]scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2,setpts=(PTS-STARTPTS)*${stretch}+${offset}/TB[v${INPUT_IDX}]")
-              VLABEL_FULL[$i]="v${INPUT_IDX}"
-              IS_FS_SOURCE[$i]=1
-            else
-              # Not a designated full-frame source (camera, or anything
-              # else that lands here): goes full-frame whenever it's
-              # active and nothing else is claiming the full frame at
-              # that moment, and shrinks to a small corner tile only
-              # during the sub-window(s) where it overlaps a genuine
-              # full-frame source (screen share / whiteboard). ffmpeg
-              # can't resize one overlay dynamically, so this needs two
-              # differently-scaled copies of the same input, each gated
-              # by the opposite half of that condition. tile_col comes
-              # from a dedicated counter over camera-like tracks only -
-              # not the raw track index i, which mixes in audio tracks
-              # and would scatter/mis-position tiles as soon as track
-              # ordering shifted (e.g. an extra mic track before a camera).
-              tile_w=320; tile_h=180; margin=10
-              tile_col=$(( TILE_COUNTER % 4 ))
-              TILE_COUNTER=$((TILE_COUNTER + 1))
-              VLABEL_FULL[$i]="v${INPUT_IDX}f"
-              VLABEL_TILE[$i]="v${INPUT_IDX}t"
-              TILE_X[$i]="W-${tile_w}-${margin}-((${tile_col})*(${tile_w}+${margin}))"
-              TILE_Y[$i]="H-${tile_h}-${margin}"
-              IS_FS_SOURCE[$i]=0
-              FILTER_PARTS+=("[${INPUT_IDX}:v]split=2[cam${INPUT_IDX}tile][cam${INPUT_IDX}full]")
-              FILTER_PARTS+=("[cam${INPUT_IDX}tile]scale=${tile_w}:${tile_h}:force_original_aspect_ratio=decrease,setpts=(PTS-STARTPTS)*${stretch}+${offset}/TB[v${INPUT_IDX}t]")
-              FILTER_PARTS+=("[cam${INPUT_IDX}full]scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2,setpts=(PTS-STARTPTS)*${stretch}+${offset}/TB[v${INPUT_IDX}f]")
-            fi
-            INPUT_IDX=$((INPUT_IDX + 1))
-          done
-
-          # Pass 2: composite in the order that actually keeps things
-          # visible - camera full-frame views first (lowest layer; mutually
-          # exclusive in time with the full-frame sources below by
-          # construction, so draw order between them never matters), then
-          # the full-frame sources themselves, then camera corner TILES
-          # last/on top so they're never painted over.
-          for i in "${!LOCAL_FILES[@]}"; do
-            [[ "${TYPES[$i]}" == "VIDEO" && "${IS_FS_SOURCE[$i]:-}" == "0" ]] || continue
-            offset="${OFFSETS[$i]}"
-            end=$(echo "$offset + ${STRETCHED_DURATIONS[$i]}" | bc)
-            FILTER_PARTS+=("[${CUR_LABEL}][${VLABEL_FULL[$i]}]overlay=enable='between(t,${offset},${end})*lte(${FS_SUM_EXPR},0)'[ovf${i}]")
-            CUR_LABEL="ovf${i}"
-          done
-          for i in "${!LOCAL_FILES[@]}"; do
-            [[ "${TYPES[$i]}" == "VIDEO" && "${IS_FS_SOURCE[$i]:-}" == "1" ]] || continue
-            offset="${OFFSETS[$i]}"
-            end=$(echo "$offset + ${STRETCHED_DURATIONS[$i]}" | bc)
-            FILTER_PARTS+=("[${CUR_LABEL}][${VLABEL_FULL[$i]}]overlay=enable='between(t,${offset},${end})'[ovs${i}]")
-            CUR_LABEL="ovs${i}"
-          done
-          for i in "${!LOCAL_FILES[@]}"; do
-            [[ "${TYPES[$i]}" == "VIDEO" && "${IS_FS_SOURCE[$i]:-}" == "0" ]] || continue
-            offset="${OFFSETS[$i]}"
-            end=$(echo "$offset + ${STRETCHED_DURATIONS[$i]}" | bc)
-            FILTER_PARTS+=("[${CUR_LABEL}][${VLABEL_TILE[$i]}]overlay=x='${TILE_X[$i]}':y='${TILE_Y[$i]}':enable='between(t,${offset},${end})*gt(${FS_SUM_EXPR},0)'[ovt${i}]")
-            CUR_LABEL="ovt${i}"
-          done
-          FINAL_VIDEO_LABEL="$CUR_LABEL"
-
-          AUDIO_INPUT_LABELS=()
-          for i in "${!LOCAL_FILES[@]}"; do
-            if [[ "${TYPES[$i]}" == "AUDIO" ]]; then
-              FFMPEG_INPUTS+=(-itsoffset "${OFFSETS[$i]}" -i "${LOCAL_FILES[$i]}")
-              stretch="${STRETCH[$i]}"
-              # Same drift correction as video, applied to audio: atempo
-              # changes playback speed (and therefore duration) instead of
-              # ffmpeg's scale/setpts, so a track whose probed duration ran
-              # short of its real wall-clock span gets slowed down by
-              # 1/stretch to fill that span instead of ending early and
-              # drifting out of sync with everything else.
-              needs_correction=1
-              (( $(echo "${stretch#-} > 0.99" | bc -l) )) && (( $(echo "${stretch#-} < 1.01" | bc -l) )) && needs_correction=0
-              if [[ "$needs_correction" -eq 1 ]]; then
-                atempo_target=$(echo "scale=6; 1 / $stretch" | bc)
-                atempo_chain=$(build_atempo_chain "$atempo_target")
-                FILTER_PARTS+=("[${INPUT_IDX}:a]${atempo_chain},asetpts=PTS-STARTPTS+${OFFSETS[$i]}/TB[a${INPUT_IDX}p]")
               else
-                FILTER_PARTS+=("[${INPUT_IDX}:a]asetpts=PTS-STARTPTS+${OFFSETS[$i]}/TB[a${INPUT_IDX}p]")
+                wall_span_note=" wall_span=unavailable(no ended_at from LiveKit)"
               fi
-              AUDIO_INPUT_LABELS+=("a${INPUT_IDX}p")
-              INPUT_IDX=$((INPUT_IDX + 1))
+              STRETCH+=("$stretch_factor")
+              stretched_dur=$(echo "scale=6; $dur * $stretch_factor" | bc)
+              STRETCHED_DURATIONS+=("$stretched_dur")
+
+              end=$(echo "$offset + $stretched_dur" | bc)
+              if (( $(echo "$end > $TOTAL_DURATION" | bc -l) )); then TOTAL_DURATION="$end"; fi
+
+              log "session $cluster_num track[$i] source=${C_SOURCES[$i]} type=${C_TYPES[$i]} offset=${offset}s duration=${dur}s${wall_span_note}"
+            done
+            TOTAL_DURATION=$(echo "($TOTAL_DURATION + 2) / 1" | bc)
+            [[ "$TOTAL_DURATION" -lt 1 ]] && TOTAL_DURATION=5
+            log "session $cluster_num total composed duration: ${TOTAL_DURATION}s"
+
+            # Pre-pass: collect every SCREEN_SHARE/WHITEBOARD ("full-frame")
+            # video track's own active window (using its STRETCHED duration,
+            # since that's how long it actually plays in the composite), so
+            # any OTHER video track (in practice: camera) can tell, at any
+            # moment t, whether something else already legitimately owns
+            # the full frame. FS_SUM_EXPR evaluates to >0 at any instant
+            # when at least one full-frame source is active, 0 otherwise (0
+            # permanently if there are no full-frame sources in this
+            # session).
+            FS_TERMS=()
+            for i in "${!C_LOCAL_FILES[@]}"; do
+              if [[ "${C_TYPES[$i]}" == "VIDEO" && ( "${C_SOURCES[$i]}" == "SCREEN_SHARE" || "${C_SOURCES[$i]}" == "WHITEBOARD" ) ]]; then
+                fs_offset="${OFFSETS[$i]}"
+                fs_end=$(echo "${OFFSETS[$i]} + ${STRETCHED_DURATIONS[$i]}" | bc)
+                FS_TERMS+=("between(t,${fs_offset},${fs_end})")
+              fi
+            done
+            if [[ "${#FS_TERMS[@]}" -eq 0 ]]; then
+              FS_SUM_EXPR="0"
+            else
+              FS_SUM_EXPR=$(IFS='+'; echo "${FS_TERMS[*]}")
             fi
+            log "session $cluster_num full-frame-active expression: $FS_SUM_EXPR"
+
+            FFMPEG_INPUTS+=(-f lavfi -i "color=c=0x0e1c76:s=1280x720:r=30:d=${TOTAL_DURATION}")
+            CUR_LABEL="0:v"
+
+            # Pass 1: register each video track's ffmpeg input and its
+            # scale/split filter stage(s) only - no compositing (overlay)
+            # yet. Compositing order matters and is handled separately in
+            # pass 2 below, because a full-frame source (screen
+            # share/whiteboard) is fully opaque: if a camera's small corner
+            # TILE were drawn onto the canvas *before* the full-frame
+            # source, the full-frame layer drawn on top afterwards would
+            # completely paint over it and the tile would never actually be
+            # visible - exactly the bug found by inspecting a real
+            # composite frame during a screen-share window and finding no
+            # camera tile there at all, even though the tile's own
+            # enable/timing logic looked correct on paper.
+            unset VLABEL_FULL VLABEL_TILE IS_FS_SOURCE TILE_X TILE_Y
+            declare -A VLABEL_FULL VLABEL_TILE IS_FS_SOURCE TILE_X TILE_Y
+            TILE_COUNTER=0
+            for i in "${!C_LOCAL_FILES[@]}"; do
+              type_v="${C_TYPES[$i]}"
+              source_v="${C_SOURCES[$i]}"
+              [[ "$type_v" == "VIDEO" ]] || continue
+
+              offset="${OFFSETS[$i]}"
+              stretch="${STRETCH[$i]}"
+              FFMPEG_INPUTS+=(-itsoffset "$offset" -i "${C_LOCAL_FILES[$i]}")
+
+              if [[ "$source_v" == "SCREEN_SHARE" || "$source_v" == "WHITEBOARD" ]]; then
+                FILTER_PARTS+=("[${INPUT_IDX}:v]scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2,setpts=(PTS-STARTPTS)*${stretch}+${offset}/TB[v${INPUT_IDX}]")
+                VLABEL_FULL[$i]="v${INPUT_IDX}"
+                IS_FS_SOURCE[$i]=1
+              else
+                # Not a designated full-frame source (camera, or anything
+                # else that lands here): goes full-frame whenever it's
+                # active and nothing else is claiming the full frame at
+                # that moment, and shrinks to a small corner tile only
+                # during the sub-window(s) where it overlaps a genuine
+                # full-frame source (screen share / whiteboard). ffmpeg
+                # can't resize one overlay dynamically, so this needs two
+                # differently-scaled copies of the same input, each gated
+                # by the opposite half of that condition. tile_col comes
+                # from a dedicated counter over camera-like tracks only -
+                # not the raw track index i, which mixes in audio tracks
+                # and would scatter/mis-position tiles as soon as track
+                # ordering shifted (e.g. an extra mic track before a
+                # camera).
+                tile_w=320; tile_h=180; margin=10
+                tile_col=$(( TILE_COUNTER % 4 ))
+                TILE_COUNTER=$((TILE_COUNTER + 1))
+                VLABEL_FULL[$i]="v${INPUT_IDX}f"
+                VLABEL_TILE[$i]="v${INPUT_IDX}t"
+                TILE_X[$i]="W-${tile_w}-${margin}-((${tile_col})*(${tile_w}+${margin}))"
+                TILE_Y[$i]="H-${tile_h}-${margin}"
+                IS_FS_SOURCE[$i]=0
+                FILTER_PARTS+=("[${INPUT_IDX}:v]split=2[cam${INPUT_IDX}tile][cam${INPUT_IDX}full]")
+                FILTER_PARTS+=("[cam${INPUT_IDX}tile]scale=${tile_w}:${tile_h}:force_original_aspect_ratio=decrease,setpts=(PTS-STARTPTS)*${stretch}+${offset}/TB[v${INPUT_IDX}t]")
+                FILTER_PARTS+=("[cam${INPUT_IDX}full]scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2,setpts=(PTS-STARTPTS)*${stretch}+${offset}/TB[v${INPUT_IDX}f]")
+              fi
+              INPUT_IDX=$((INPUT_IDX + 1))
+            done
+
+            # Pass 2: composite in the order that actually keeps things
+            # visible - camera full-frame views first (lowest layer;
+            # mutually exclusive in time with the full-frame sources below
+            # by construction, so draw order between them never matters),
+            # then the full-frame sources themselves, then camera corner
+            # TILES last/on top so they're never painted over.
+            for i in "${!C_LOCAL_FILES[@]}"; do
+              [[ "${C_TYPES[$i]}" == "VIDEO" && "${IS_FS_SOURCE[$i]:-}" == "0" ]] || continue
+              offset="${OFFSETS[$i]}"
+              end=$(echo "$offset + ${STRETCHED_DURATIONS[$i]}" | bc)
+              FILTER_PARTS+=("[${CUR_LABEL}][${VLABEL_FULL[$i]}]overlay=enable='between(t,${offset},${end})*lte(${FS_SUM_EXPR},0)'[ovf${i}]")
+              CUR_LABEL="ovf${i}"
+            done
+            for i in "${!C_LOCAL_FILES[@]}"; do
+              [[ "${C_TYPES[$i]}" == "VIDEO" && "${IS_FS_SOURCE[$i]:-}" == "1" ]] || continue
+              offset="${OFFSETS[$i]}"
+              end=$(echo "$offset + ${STRETCHED_DURATIONS[$i]}" | bc)
+              FILTER_PARTS+=("[${CUR_LABEL}][${VLABEL_FULL[$i]}]overlay=enable='between(t,${offset},${end})'[ovs${i}]")
+              CUR_LABEL="ovs${i}"
+            done
+            for i in "${!C_LOCAL_FILES[@]}"; do
+              [[ "${C_TYPES[$i]}" == "VIDEO" && "${IS_FS_SOURCE[$i]:-}" == "0" ]] || continue
+              offset="${OFFSETS[$i]}"
+              end=$(echo "$offset + ${STRETCHED_DURATIONS[$i]}" | bc)
+              FILTER_PARTS+=("[${CUR_LABEL}][${VLABEL_TILE[$i]}]overlay=x='${TILE_X[$i]}':y='${TILE_Y[$i]}':enable='between(t,${offset},${end})*gt(${FS_SUM_EXPR},0)'[ovt${i}]")
+              CUR_LABEL="ovt${i}"
+            done
+            FINAL_VIDEO_LABEL="$CUR_LABEL"
+
+            AUDIO_INPUT_LABELS=()
+            for i in "${!C_LOCAL_FILES[@]}"; do
+              if [[ "${C_TYPES[$i]}" == "AUDIO" ]]; then
+                FFMPEG_INPUTS+=(-itsoffset "${OFFSETS[$i]}" -i "${C_LOCAL_FILES[$i]}")
+                stretch="${STRETCH[$i]}"
+                # Same drift correction as video, applied to audio: atempo
+                # changes playback speed (and therefore duration) instead
+                # of ffmpeg's scale/setpts, so a track whose probed
+                # duration ran short of its real wall-clock span gets
+                # slowed down by 1/stretch to fill that span instead of
+                # ending early and drifting out of sync with everything
+                # else.
+                needs_correction=1
+                (( $(echo "${stretch#-} > 0.99" | bc -l) )) && (( $(echo "${stretch#-} < 1.01" | bc -l) )) && needs_correction=0
+                if [[ "$needs_correction" -eq 1 ]]; then
+                  atempo_target=$(echo "scale=6; 1 / $stretch" | bc)
+                  atempo_chain=$(build_atempo_chain "$atempo_target")
+                  FILTER_PARTS+=("[${INPUT_IDX}:a]${atempo_chain},asetpts=PTS-STARTPTS+${OFFSETS[$i]}/TB[a${INPUT_IDX}p]")
+                else
+                  FILTER_PARTS+=("[${INPUT_IDX}:a]asetpts=PTS-STARTPTS+${OFFSETS[$i]}/TB[a${INPUT_IDX}p]")
+                fi
+                AUDIO_INPUT_LABELS+=("a${INPUT_IDX}p")
+                INPUT_IDX=$((INPUT_IDX + 1))
+              fi
+            done
+
+            if [[ "${#AUDIO_INPUT_LABELS[@]}" -eq 0 ]]; then
+              FFMPEG_INPUTS+=(-f lavfi -i "anullsrc=r=48000:cl=stereo:d=${TOTAL_DURATION}")
+              AUDIO_INPUT_LABELS+=("${INPUT_IDX}:a")
+              INPUT_IDX=$((INPUT_IDX + 1))
+              FINAL_AUDIO_LABEL="${AUDIO_INPUT_LABELS[0]}"
+            elif [[ "${#AUDIO_INPUT_LABELS[@]}" -eq 1 ]]; then
+              FINAL_AUDIO_LABEL="${AUDIO_INPUT_LABELS[0]}"
+            else
+              mix_inputs=""
+              for lbl in "${AUDIO_INPUT_LABELS[@]}"; do mix_inputs+="[${lbl}]"; done
+              FILTER_PARTS+=("${mix_inputs}amix=inputs=${#AUDIO_INPUT_LABELS[@]}:duration=longest:dropout_transition=0[outa]")
+              FINAL_AUDIO_LABEL="outa"
+            fi
+
+            # Safety net, independent of *why* an audio stream might come up
+            # short (a drift-correction miscalculation, a source file with
+            # imprecise internal duration metadata, or anything else not
+            # yet seen): pad the final audio with silence out to the full
+            # composed duration, so a short audio stream can never leave
+            # the tail of a recording with picture but no sound. The final
+            # -t below still trims anything too long, so this only ever
+            # adds silence, never cuts real audio short. This also gives
+            # every path (0, 1, or 2+ audio tracks) the same filter-graph
+            # output label, so mapping it is always just "[finalaudio]" -
+            # no more bare-stream-ref-vs-label branching needed for -map.
+            FILTER_PARTS+=("[${FINAL_AUDIO_LABEL}]apad=whole_dur=${TOTAL_DURATION}[finalaudio]")
+            AUDIO_MAP_ARG="[finalaudio]"
+
+            FILTER_COMPLEX=$(IFS=';'; echo "${FILTER_PARTS[*]}")
+
+            if [[ "$CLUSTER_COUNT" -gt 1 ]]; then
+              FILE_NAME="${ROOM_ID}__session${cluster_num}.mp4"
+            else
+              FILE_NAME="${ROOM_ID}.mp4"
+            fi
+            OUT_MP4="${WORKDIR}/${FILE_NAME}"
+            log "session $cluster_num: running ffmpeg..."
+            log "session $cluster_num filter_complex: $FILTER_COMPLEX"
+
+            # FILTER_COMPLEX always has at least the apad stage above now
+            # (it is never empty), so there's always a real filter graph to
+            # run - no more empty-filter fallback path needed.
+            ffmpeg -y -hide_banner -loglevel warning -nostdin \
+              "${FFMPEG_INPUTS[@]}" \
+              -filter_complex "$FILTER_COMPLEX" \
+              -map "[${FINAL_VIDEO_LABEL}]" -map "$AUDIO_MAP_ARG" \
+              -c:v libx264 -preset fast -crf 20 -pix_fmt yuv420p \
+              -c:a aac -b:a 160k \
+              -t "$TOTAL_DURATION" -movflags +faststart \
+              "$OUT_MP4" </dev/null
+
+            FFMPEG_STATUS=$?
+            if [[ $FFMPEG_STATUS -ne 0 || ! -s "$OUT_MP4" ]]; then
+              fail "session $cluster_num: ffmpeg failed (exit $FFMPEG_STATUS) or produced an empty file - nothing deleted from R2, and no marker was advanced past any earlier session in this run."
+            fi
+
+            LOCAL_SIZE=$(stat -c%s "$OUT_MP4")
+            log "session $cluster_num ffmpeg done: $OUT_MP4 ($LOCAL_SIZE bytes)"
+
+            TS=$(date -u +%s)
+            R2_KEY="compressed/${ROOM_ID}/${TS}_${FILE_NAME}"
+
+            log "session $cluster_num: uploading compressed MP4 -> r2://${R2_BUCKET_NAME}/${R2_KEY}"
+            if ! rclone_ copyto "$OUT_MP4" "${RCLONE_REMOTE}:${R2_BUCKET_NAME}/${R2_KEY}"; then
+              fail "session $cluster_num: upload of compressed MP4 to R2 failed - nothing deleted."
+            fi
+
+            REMOTE_SIZE=$(rclone_ size "${RCLONE_REMOTE}:${R2_BUCKET_NAME}/${R2_KEY}" --json 2>/dev/null | jq -r '.bytes // 0')
+            if [[ "$REMOTE_SIZE" != "$LOCAL_SIZE" ]]; then
+              fail "session $cluster_num: uploaded file size mismatch (local=$LOCAL_SIZE, r2=$REMOTE_SIZE) - nothing deleted."
+            fi
+            log "session $cluster_num upload verified: $REMOTE_SIZE bytes in R2 match local file"
+
+            RECORDING_ID=$(python3 -c "import uuid;print(uuid.uuid4())")
+            REGISTER_PAYLOAD=$(jq -n \
+              --arg room_id "$ROOM_ID" \
+              --arg recording_id "$RECORDING_ID" \
+              --arg file_name "$FILE_NAME" \
+              --arg r2_key "$R2_KEY" \
+              --argjson file_size_bytes "$LOCAL_SIZE" \
+              '{room_id: $room_id, recording_id: $recording_id, file_name: $file_name, r2_key: $r2_key, file_size_bytes: $file_size_bytes}')
+
+            log "session $cluster_num: registering recording with Supabase..."
+            REGISTER_RESPONSE=$(curl -sS -X POST "${SUPABASE_URL}/functions/v1/register-recording" \
+              -H "Content-Type: application/json" \
+              -H "x-hook-secret: ${RECORDER_HOOK_SECRET}" \
+              -d "$REGISTER_PAYLOAD")
+
+            if ! jq -e '.ok == true' <<<"$REGISTER_RESPONSE" >/dev/null 2>&1; then
+              fail "session $cluster_num: register-recording call failed: $REGISTER_RESPONSE - MP4 IS safely in R2 at ${R2_KEY}, nothing deleted."
+            fi
+            log "session $cluster_num registered OK: $REGISTER_RESPONSE"
+            OUTPUT_SUMMARY+=("${R2_KEY}")
+
+            # Only advance the marker past this session's tracks now that
+            # this session has actually fully succeeded (uploaded +
+            # registered) - a run that fails partway through a LATER
+            # session leaves the marker at whatever the last successful
+            # session reached, so a retry only redoes the session(s) that
+            # didn't finish, never one that's already safely uploaded and
+            # registered.
+            CLUSTER_MAX_ENDED="0"
+            for e in "${C_ENDS[@]}"; do
+              if (( $(echo "$e > $CLUSTER_MAX_ENDED" | bc -l) )); then CLUSTER_MAX_ENDED="$e"; fi
+            done
+            if (( $(echo "$CLUSTER_MAX_ENDED > $MARKER_FLOOR" | bc -l) )); then
+              echo "$CLUSTER_MAX_ENDED" > "${WORKDIR}/new_marker.txt"
+              if rclone_ copyto "${WORKDIR}/new_marker.txt" "${RCLONE_REMOTE}:${R2_BUCKET_NAME}/${MARKER_KEY}"; then
+                log "advanced last-processed marker for this room to ended_at=${CLUSTER_MAX_ENDED} (after session $cluster_num)"
+                MARKER_FLOOR="$CLUSTER_MAX_ENDED"
+              else
+                log "WARNING: failed to write the last-processed marker after session $cluster_num (non-fatal - a future run for this room may reprocess this session)"
+              fi
+            fi
+
+            unset CL_IDX C_LOCAL_FILES C_SOURCES C_TYPES C_STARTS C_ENDS
+            unset OFFSETS DURATIONS STRETCH STRETCHED_DURATIONS
+            unset VLABEL_FULL VLABEL_TILE IS_FS_SOURCE TILE_X TILE_Y
           done
 
-          if [[ "${#AUDIO_INPUT_LABELS[@]}" -eq 0 ]]; then
-            FFMPEG_INPUTS+=(-f lavfi -i "anullsrc=r=48000:cl=stereo:d=${TOTAL_DURATION}")
-            AUDIO_INPUT_LABELS+=("${INPUT_IDX}:a")
-            INPUT_IDX=$((INPUT_IDX + 1))
-            FINAL_AUDIO_LABEL="${AUDIO_INPUT_LABELS[0]}"
-          elif [[ "${#AUDIO_INPUT_LABELS[@]}" -eq 1 ]]; then
-            FINAL_AUDIO_LABEL="${AUDIO_INPUT_LABELS[0]}"
-          else
-            mix_inputs=""
-            for lbl in "${AUDIO_INPUT_LABELS[@]}"; do mix_inputs+="[${lbl}]"; done
-            FILTER_PARTS+=("${mix_inputs}amix=inputs=${#AUDIO_INPUT_LABELS[@]}:duration=longest:dropout_transition=0[outa]")
-            FINAL_AUDIO_LABEL="outa"
-          fi
-
-          # Safety net, independent of *why* an audio stream might come up
-          # short (a drift-correction miscalculation, a source file with
-          # imprecise internal duration metadata, or anything else not yet
-          # seen): pad the final audio with silence out to the full composed
-          # duration, so a short audio stream can never leave the tail of a
-          # recording with picture but no sound. The final -t below still
-          # trims anything too long, so this only ever adds silence, never
-          # cuts real audio short. This also gives every path (0, 1, or 2+
-          # audio tracks) the same filter-graph output label, so mapping it
-          # is always just "[finalaudio]" - no more bare-stream-ref-vs-label
-          # branching needed for -map.
-          FILTER_PARTS+=("[${FINAL_AUDIO_LABEL}]apad=whole_dur=${TOTAL_DURATION}[finalaudio]")
-          AUDIO_MAP_ARG="[finalaudio]"
-
-          FILTER_COMPLEX=$(IFS=';'; echo "${FILTER_PARTS[*]}")
-
-          OUT_MP4="${WORKDIR}/${ROOM_ID}.mp4"
-          log "running ffmpeg..."
-          log "filter_complex: $FILTER_COMPLEX"
-
-          # FILTER_COMPLEX always has at least the apad stage above now (it
-          # is never empty), so there's always a real filter graph to run -
-          # no more empty-filter fallback path needed.
-          ffmpeg -y -hide_banner -loglevel warning -nostdin \
-            "${FFMPEG_INPUTS[@]}" \
-            -filter_complex "$FILTER_COMPLEX" \
-            -map "[${FINAL_VIDEO_LABEL}]" -map "$AUDIO_MAP_ARG" \
-            -c:v libx264 -preset fast -crf 20 -pix_fmt yuv420p \
-            -c:a aac -b:a 160k \
-            -t "$TOTAL_DURATION" -movflags +faststart \
-            "$OUT_MP4" </dev/null
-
-          FFMPEG_STATUS=$?
-          if [[ $FFMPEG_STATUS -ne 0 || ! -s "$OUT_MP4" ]]; then
-            fail "ffmpeg failed (exit $FFMPEG_STATUS) or produced an empty file - nothing deleted from R2."
-          fi
-
-          LOCAL_SIZE=$(stat -c%s "$OUT_MP4")
-          log "ffmpeg done: $OUT_MP4 ($LOCAL_SIZE bytes)"
-
-          FILE_NAME="${ROOM_ID}.mp4"
-          TS=$(date -u +%s)
-          R2_KEY="compressed/${ROOM_ID}/${TS}_${FILE_NAME}"
-
-          log "uploading compressed MP4 -> r2://${R2_BUCKET_NAME}/${R2_KEY}"
-          if ! rclone_ copyto "$OUT_MP4" "${RCLONE_REMOTE}:${R2_BUCKET_NAME}/${R2_KEY}"; then
-            fail "upload of compressed MP4 to R2 failed - nothing deleted."
-          fi
-
-          REMOTE_SIZE=$(rclone_ size "${RCLONE_REMOTE}:${R2_BUCKET_NAME}/${R2_KEY}" --json 2>/dev/null | jq -r '.bytes // 0')
-          if [[ "$REMOTE_SIZE" != "$LOCAL_SIZE" ]]; then
-            fail "uploaded file size mismatch (local=$LOCAL_SIZE, r2=$REMOTE_SIZE) - nothing deleted."
-          fi
-          log "upload verified: $REMOTE_SIZE bytes in R2 match local file"
-
-          RECORDING_ID=$(python3 -c "import uuid;print(uuid.uuid4())")
-          REGISTER_PAYLOAD=$(jq -n \
-            --arg room_id "$ROOM_ID" \
-            --arg recording_id "$RECORDING_ID" \
-            --arg file_name "$FILE_NAME" \
-            --arg r2_key "$R2_KEY" \
-            --argjson file_size_bytes "$LOCAL_SIZE" \
-            '{room_id: $room_id, recording_id: $recording_id, file_name: $file_name, r2_key: $r2_key, file_size_bytes: $file_size_bytes}')
-
-          log "registering recording with Supabase..."
-          REGISTER_RESPONSE=$(curl -sS -X POST "${SUPABASE_URL}/functions/v1/register-recording" \
-            -H "Content-Type: application/json" \
-            -H "x-hook-secret: ${RECORDER_HOOK_SECRET}" \
-            -d "$REGISTER_PAYLOAD")
-
-          if ! jq -e '.ok == true' <<<"$REGISTER_RESPONSE" >/dev/null 2>&1; then
-            fail "register-recording call failed: $REGISTER_RESPONSE - MP4 IS safely in R2 at ${R2_KEY}, nothing deleted."
-          fi
-          log "registered OK: $REGISTER_RESPONSE"
-
-          # Only advance the "already processed" marker now that everything
-          # above has actually succeeded (uploaded + registered) - a run
-          # that fails earlier leaves the marker untouched, so a retry
-          # still sees and retries every track it saw this time.
-          if (( $(echo "$MAX_ENDED_SEEN > 0" | bc -l) )); then
+          # Belt-and-braces final marker advance: MAX_ENDED_SEEN (tracked
+          # during the download loop above, across every parseable item
+          # LiveKit reported - including ones that had no downloadable file
+          # or no discoverable filename) covers items that could never form
+          # part of any session above. Advancing the marker to cover those
+          # too, now that every real session has succeeded, stops the
+          # pipeline retrying a permanently-broken egress record forever;
+          # if MARKER_FLOOR already reached or passed it (the normal case),
+          # this is a no-op.
+          if (( $(echo "$MAX_ENDED_SEEN > $MARKER_FLOOR" | bc -l) )); then
             echo "$MAX_ENDED_SEEN" > "${WORKDIR}/new_marker.txt"
             if rclone_ copyto "${WORKDIR}/new_marker.txt" "${RCLONE_REMOTE}:${R2_BUCKET_NAME}/${MARKER_KEY}"; then
-              log "advanced last-processed marker for this room to ended_at=${MAX_ENDED_SEEN}"
+              log "advanced last-processed marker for this room to ended_at=${MAX_ENDED_SEEN} (covers unusable items too)"
             else
-              log "WARNING: failed to write the last-processed marker (non-fatal - a future run for this room may reprocess some tracks from this run)"
+              log "WARNING: failed to write the final catch-all marker (non-fatal)"
             fi
           fi
 
@@ -707,7 +817,11 @@ jobs:
             done
           fi
 
-          log "==== done: room $ROOM_ID -> r2://${R2_BUCKET_NAME}/${R2_KEY} ===="
+          SUMMARY_LINE=""
+          for k in "${OUTPUT_SUMMARY[@]}"; do
+            SUMMARY_LINE="${SUMMARY_LINE} r2://${R2_BUCKET_NAME}/${k}"
+          done
+          log "==== done: room $ROOM_ID -> ${#OUTPUT_SUMMARY[@]} session(s) uploaded:${SUMMARY_LINE} ===="
 
       - name: Clean up workdir
         if: always()

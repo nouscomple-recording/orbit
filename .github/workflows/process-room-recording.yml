@@ -528,10 +528,23 @@ jobs:
           fi
           log "registered OK: $REGISTER_RESPONSE"
 
-          log "cleaning up: deleting raw per-track R2 objects..."
-          for key in "${RAW_KEYS[@]}"; do
-            rclone_ deletefile "${RCLONE_REMOTE}:${R2_BUCKET_NAME}/${key}" || true
-          done
+          # TEMPORARY, while we're still actively debugging capture-quality
+          # issues (freezing/drift/etc.): keep the raw per-track files in R2
+          # instead of deleting them, so if a defect shows up in the final
+          # composited MP4 we can pull the exact raw webm/ogg for that track
+          # and tell whether it originated upstream (in the browser/LiveKit
+          # capture itself) or in this script's compositing. Flip
+          # KEEP_RAW_FILES_FOR_DEBUGGING to "false" below once we've had a
+          # clean, fully-validated end-to-end test and want cleanup back on.
+          KEEP_RAW_FILES_FOR_DEBUGGING=true
+          if [[ "$KEEP_RAW_FILES_FOR_DEBUGGING" == "true" ]]; then
+            log "cleaning up: SKIPPED (KEEP_RAW_FILES_FOR_DEBUGGING=true) - raw per-track files left in R2 for forensics: ${RAW_KEYS[*]}"
+          else
+            log "cleaning up: deleting raw per-track R2 objects..."
+            for key in "${RAW_KEYS[@]}"; do
+              rclone_ deletefile "${RCLONE_REMOTE}:${R2_BUCKET_NAME}/${key}" || true
+            done
+          fi
 
           log "==== done: room $ROOM_ID -> r2://${R2_BUCKET_NAME}/${R2_KEY} ===="
 

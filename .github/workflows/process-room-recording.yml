@@ -174,6 +174,27 @@ jobs:
           fi
           log "found $ITEM_COUNT egress job(s)"
 
+          # LiveKit's ListEgress returns EVERY egress job ever run for this
+          # room_name, not just ones from the current session - confirmed
+          # directly: reprocessing the same test room a second time picked
+          # up the first run's already-composited tracks again and merged
+          # them into the new video (visible as a bogus "sync anchor" from
+          # the earlier run and a total duration spanning both sessions).
+          # A marker file in R2 remembers the newest `ended_at` this room
+          # has successfully finished processing through, so a re-run (or a
+          # genuinely reused room, e.g. a recurring weekly class) only
+          # picks up tracks that are actually new. It's written only after
+          # a fully successful run below, so a run that fails partway
+          # through leaves it untouched and nothing already-seen is lost.
+          MARKER_KEY="markers/${ROOM_ID}/last_processed_ended_at.txt"
+          LAST_PROCESSED_ENDED_AT="0"
+          if rclone_ cat "${RCLONE_REMOTE}:${R2_BUCKET_NAME}/${MARKER_KEY}" > "${WORKDIR}/marker.txt" 2>/dev/null; then
+            LAST_PROCESSED_ENDED_AT=$(tr -d '[:space:]' < "${WORKDIR}/marker.txt")
+            [[ -z "$LAST_PROCESSED_ENDED_AT" ]] && LAST_PROCESSED_ENDED_AT="0"
+          fi
+          log "last-processed marker for this room: ended_at <= ${LAST_PROCESSED_ENDED_AT} already handled"
+          MAX_ENDED_SEEN="0"
+
           extract_result_key() {
             echo "$1" | jq -r '(.file_results // [])[0] | (.filename // .file // .location // empty)'
           }
@@ -215,15 +236,42 @@ jobs:
 
           echo "$FINAL_JSON" | jq -c '.items // [] | .[]' > "${WORKDIR}/items.ndjson"
           while IFS= read -r item; do
-            key=$(extract_result_key "$item")
-            if [[ -z "$key" ]]; then
-              log "WARNING: an egress item had no discoverable output filename - skipping it. Full item: $item"
+            if ! echo "$item" | jq empty >/dev/null 2>&1; then
+              # This item's own JSON is not even parseable - distinct from
+              # "parsed fine, just no filename field" below. Seen exactly
+              # once in practice, caused by a subprocess earlier in this
+              # same loop iteration reading from stdin and stealing bytes
+              # from this file out from under `read` (see the -nostdin
+              # comment on the normalization ffmpeg call above) - logging
+              # the length here is a quick way to confirm/rule that out if
+              # it ever recurs.
+              log "WARNING: a line from items.ndjson was not valid JSON (length ${#item} chars) - skipping it. Raw: $item"
               continue
             fi
             started_raw=$(echo "$item" | jq -r '.started_at // 0')
             started=$(normalize_epoch_seconds "$started_raw")
             ended_raw=$(echo "$item" | jq -r '.ended_at // 0')
             ended=$(normalize_epoch_seconds "$ended_raw")
+
+            # Track the newest ended_at across every item this run has seen
+            # at all (whether or not it ends up used), so the marker
+            # written at the end of a successful run reflects everything
+            # LiveKit reported this time - see the marker comment above.
+            if [[ "$ended" != "0" ]] && (( $(echo "$ended > $MAX_ENDED_SEEN" | bc -l) )); then
+              MAX_ENDED_SEEN="$ended"
+            fi
+            if [[ "$ended" != "0" ]] && (( $(echo "$ended <= $LAST_PROCESSED_ENDED_AT" | bc -l) )); then
+              skip_track_id=$(echo "$item" | jq -r '.track.track_id // "unknown"')
+              log "skipping already-processed egress (ended_at=$ended <= marker=$LAST_PROCESSED_ENDED_AT) - track_id=$skip_track_id"
+              continue
+            fi
+
+            key=$(extract_result_key "$item")
+            if [[ -z "$key" ]]; then
+              log "WARNING: an egress item had no discoverable output filename - skipping it. Full item (pretty-printed so nothing gets lost on one huge line):"
+              echo "$item" | jq .
+              continue
+            fi
 
             base=$(basename "$key")
             base_noext="${base%.*}"
@@ -262,10 +310,33 @@ jobs:
             # all, regardless of what the raw capture did.
             if [[ "$type_v" == "VIDEO" ]]; then
               norm_file="${local_file}_norm.mp4"
-              if ffmpeg -y -hide_banner -loglevel warning -i "$local_file" \
+              # -nostdin (and redirecting stdin from /dev/null as a belt-
+              # and-braces second layer) is NOT optional here: this whole
+              # block runs inside `while read -r item; do ... done <
+              # items.ndjson`, so without it ffmpeg inherits that same
+              # loop's stdin - i.e. the *file descriptor reading
+              # items.ndjson* - and its usual "poll stdin for interactive
+              # keypresses" behavior silently steals bytes from whatever
+              # item comes next in that file. That exact bug was caught
+              # live: it corrupted the start of the next egress item's JSON
+              # (the item literally started reading mid-way through, e.g.
+              # from `Nw","room_id":...` instead of `{"egress_id":"EG_...
+              # Nw","room_id":...`), which made `extract_result_key` fail
+              # on perfectly valid data and silently drop that track (once
+              # a stale duplicate recording, once a real screen-share) -
+              # nothing to do with LiveKit or the JSON shape, purely this
+              # missing flag.
+              # crf 16 (not the 20 used for the final deliverable) because
+              # this file is a throwaway intermediate that the main
+              # compositing pass below will re-encode again at crf 20 - two
+              # lossy generations in a row otherwise compounds more visible
+              # quality loss than a single pass, and the extra disk space
+              # here costs nothing since it's deleted with the rest of the
+              # workdir at the end of the job.
+              if ffmpeg -y -hide_banner -loglevel warning -nostdin -i "$local_file" \
                    -vf "scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2,fps=30" \
-                   -c:v libx264 -preset veryfast -crf 20 -pix_fmt yuv420p -an \
-                   "$norm_file" && [[ -s "$norm_file" ]]; then
+                   -c:v libx264 -preset veryfast -crf 16 -pix_fmt yuv420p -an \
+                   "$norm_file" </dev/null && [[ -s "$norm_file" ]]; then
                 log "normalized $key to constant 1280x720/30fps -> ${norm_file}"
                 local_file="$norm_file"
               else
@@ -553,14 +624,14 @@ jobs:
           # FILTER_COMPLEX always has at least the apad stage above now (it
           # is never empty), so there's always a real filter graph to run -
           # no more empty-filter fallback path needed.
-          ffmpeg -y -hide_banner -loglevel warning \
+          ffmpeg -y -hide_banner -loglevel warning -nostdin \
             "${FFMPEG_INPUTS[@]}" \
             -filter_complex "$FILTER_COMPLEX" \
             -map "[${FINAL_VIDEO_LABEL}]" -map "$AUDIO_MAP_ARG" \
             -c:v libx264 -preset fast -crf 20 -pix_fmt yuv420p \
             -c:a aac -b:a 160k \
             -t "$TOTAL_DURATION" -movflags +faststart \
-            "$OUT_MP4"
+            "$OUT_MP4" </dev/null
 
           FFMPEG_STATUS=$?
           if [[ $FFMPEG_STATUS -ne 0 || ! -s "$OUT_MP4" ]]; then
@@ -604,6 +675,19 @@ jobs:
             fail "register-recording call failed: $REGISTER_RESPONSE - MP4 IS safely in R2 at ${R2_KEY}, nothing deleted."
           fi
           log "registered OK: $REGISTER_RESPONSE"
+
+          # Only advance the "already processed" marker now that everything
+          # above has actually succeeded (uploaded + registered) - a run
+          # that fails earlier leaves the marker untouched, so a retry
+          # still sees and retries every track it saw this time.
+          if (( $(echo "$MAX_ENDED_SEEN > 0" | bc -l) )); then
+            echo "$MAX_ENDED_SEEN" > "${WORKDIR}/new_marker.txt"
+            if rclone_ copyto "${WORKDIR}/new_marker.txt" "${RCLONE_REMOTE}:${R2_BUCKET_NAME}/${MARKER_KEY}"; then
+              log "advanced last-processed marker for this room to ended_at=${MAX_ENDED_SEEN}"
+            else
+              log "WARNING: failed to write the last-processed marker (non-fatal - a future run for this room may reprocess some tracks from this run)"
+            fi
+          fi
 
           # TEMPORARY, while we're still actively debugging capture-quality
           # issues (freezing/drift/etc.): keep the raw per-track files in R2

@@ -569,6 +569,61 @@ jobs:
             [[ "$TOTAL_DURATION" -lt 1 ]] && TOTAL_DURATION=5
             log "session $cluster_num total composed duration: ${TOTAL_DURATION}s"
 
+            # ---- Lock a SCREEN_SHARE_AUDIO track to its own video, instead
+            # of drift-correcting it independently ----
+            #
+            # LiveKit egresses a screen share's video and its accompanying
+            # system audio as two SEPARATE tracks, each with its own
+            # started_at/ended_at and its own probed file duration - so each
+            # one gets its OWN independent drift measurement above. In a
+            # real run those two measurements came out different (video:
+            # -7% -> stretched by 1.086746; audio: -2%, left unstretched)
+            # for what is supposed to be the exact same real-time window,
+            # and with a starting offset that already differed by ~0.7s
+            # before either correction was even applied. Correcting them
+            # separately means they only coincidentally start together and
+            # then drift apart from each other for the rest of the share -
+            # on that real ~50s segment the two ends up roughly 3 seconds
+            # apart, so the shared audio keeps playing (or cuts out) while
+            # the video has already moved on to something else - reported
+            # as the shared audio "overlapping" the wrong video/audio. A
+            # SCREEN_SHARE_AUDIO track is never watched on its own - it only
+            # ever means anything alongside its matching SCREEN_SHARE video
+            # - so instead of measuring its own drift, it inherits the
+            # offset and stretch factor of whichever SCREEN_SHARE video
+            # track's own wall-clock [start,end] overlaps it most (falling
+            # back to nearest-start if none technically overlap, e.g. one
+            # LiveKit job ended a fraction of a second before the other
+            # began). That keeps the two glued together for the audio's
+            # entire real duration, exactly like a real editor would.
+            for i in "${!C_LOCAL_FILES[@]}"; do
+              [[ "${C_TYPES[$i]}" == "AUDIO" && "${C_SOURCES[$i]}" == "SCREEN_SHARE_AUDIO" ]] || continue
+              best_j=-1
+              best_overlap=""
+              for j in "${!C_LOCAL_FILES[@]}"; do
+                [[ "${C_TYPES[$j]}" == "VIDEO" && "${C_SOURCES[$j]}" == "SCREEN_SHARE" ]] || continue
+                [[ "${C_STARTS[$i]}" == "0" || "${C_STARTS[$j]}" == "0" ]] && continue
+                overlap=$(echo "$(echo "${C_ENDS[$i]} < ${C_ENDS[$j]}" | bc -l | grep -q 1 && echo "${C_ENDS[$i]}" || echo "${C_ENDS[$j]}") - $(echo "${C_STARTS[$i]} > ${C_STARTS[$j]}" | bc -l | grep -q 1 && echo "${C_STARTS[$i]}" || echo "${C_STARTS[$j]}")" | bc)
+                if [[ -z "$best_overlap" ]] || (( $(echo "$overlap > $best_overlap" | bc -l) )); then
+                  best_overlap="$overlap"
+                  best_j="$j"
+                fi
+              done
+              if [[ "$best_j" != "-1" ]]; then
+                old_offset="${OFFSETS[$i]}"
+                old_stretch="${STRETCH[$i]}"
+                OFFSETS[$i]="${OFFSETS[$best_j]}"
+                STRETCH[$i]="${STRETCH[$best_j]}"
+                new_stretched_dur=$(echo "scale=6; ${DURATIONS[$i]} * ${STRETCH[$i]}" | bc)
+                STRETCHED_DURATIONS[$i]="$new_stretched_dur"
+                new_end=$(echo "${OFFSETS[$i]} + $new_stretched_dur" | bc)
+                if (( $(echo "$new_end > $TOTAL_DURATION" | bc -l) )); then
+                  TOTAL_DURATION=$(echo "($new_end + 2) / 1" | bc)
+                fi
+                log "session $cluster_num track[$i] source=SCREEN_SHARE_AUDIO: locked to track[$best_j]'s timeline (offset ${old_offset}s->${OFFSETS[$i]}s, stretch ${old_stretch}->${STRETCH[$i]}) instead of its own independently-measured drift, so it can't drift apart from its own video over the length of the share"
+              fi
+            done
+
             # Pre-pass: collect every SCREEN_SHARE/WHITEBOARD ("full-frame")
             # video track's own active window (using its STRETCHED duration,
             # since that's how long it actually plays in the composite), so

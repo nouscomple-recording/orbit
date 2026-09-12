@@ -241,6 +241,39 @@ jobs:
               continue
             fi
 
+            # Normalize every VIDEO track to a constant resolution/frame rate
+            # BEFORE it ever reaches the main compositing filter graph.
+            # Root cause this fixes: a LiveKit camera Track Egress can
+            # genuinely change resolution mid-recording (observed directly:
+            # one participant's raw camera .webm was 120x90 for the first
+            # ~290s, then jumped to 640x480 for the rest - almost certainly
+            # a simulcast layer switch as their bandwidth/CPU conditions
+            # changed). ffmpeg's scale/overlay filters are built assuming a
+            # fixed input size for the life of the stream; they don't
+            # recover cleanly from a resolution change partway through, and
+            # in a complex multi-stage overlay graph like this one, that
+            # single input a breaking silently took down that participant's
+            # WHOLE remaining contribution to the composite - both their
+            # corner tile during a screen-share/whiteboard window and their
+            # full-frame view afterwards, leaving a plain blank canvas
+            # instead where their camera should have been. Re-encoding each
+            # video track once, up front, to a fixed 1280x720/30fps here
+            # means the main filter graph never sees a resolution change at
+            # all, regardless of what the raw capture did.
+            if [[ "$type_v" == "VIDEO" ]]; then
+              norm_file="${local_file}_norm.mp4"
+              if ffmpeg -y -hide_banner -loglevel warning -i "$local_file" \
+                   -vf "scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2,fps=30" \
+                   -c:v libx264 -preset veryfast -crf 20 -pix_fmt yuv420p -an \
+                   "$norm_file" && [[ -s "$norm_file" ]]; then
+                log "normalized $key to constant 1280x720/30fps -> ${norm_file}"
+                local_file="$norm_file"
+              else
+                log "WARNING: normalization failed for $key - using raw file as-is (may hit the mid-stream-resolution-change bug if this file has one)"
+                rm -f "$norm_file"
+              fi
+            fi
+
             RAW_KEYS+=("$key")
             LOCAL_FILES+=("$local_file")
             SOURCES+=("$source_v")
@@ -374,43 +407,87 @@ jobs:
           FFMPEG_INPUTS+=(-f lavfi -i "color=c=0x0e1c76:s=1280x720:r=30:d=${TOTAL_DURATION}")
           CUR_LABEL="0:v"
 
+          # Pass 1: register each video track's ffmpeg input and its
+          # scale/split filter stage(s) only - no compositing (overlay) yet.
+          # Compositing order matters and is handled separately in pass 2
+          # below, because a full-frame source (screen share/whiteboard) is
+          # fully opaque: if a camera's small corner TILE were drawn onto
+          # the canvas *before* the full-frame source, the full-frame layer
+          # drawn on top afterwards would completely paint over it and the
+          # tile would never actually be visible - exactly the bug found by
+          # inspecting a real composite frame during a screen-share window
+          # and finding no camera tile there at all, even though the tile's
+          # own enable/timing logic looked correct on paper.
+          declare -A VLABEL_FULL VLABEL_TILE IS_FS_SOURCE TILE_X TILE_Y
+          TILE_COUNTER=0
           for i in "${!LOCAL_FILES[@]}"; do
             type_v="${TYPES[$i]}"
             source_v="${SOURCES[$i]}"
-            offset="${OFFSETS[$i]}"
-            dur="${STRETCHED_DURATIONS[$i]}"
-            end=$(echo "$offset + $dur" | bc)
+            [[ "$type_v" == "VIDEO" ]] || continue
 
-            if [[ "$type_v" == "VIDEO" ]]; then
-              FFMPEG_INPUTS+=(-itsoffset "$offset" -i "${LOCAL_FILES[$i]}")
-              stretch="${STRETCH[$i]}"
-              if [[ "$source_v" == "SCREEN_SHARE" || "$source_v" == "WHITEBOARD" ]]; then
-                FILTER_PARTS+=("[${INPUT_IDX}:v]scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2,setpts=(PTS-STARTPTS)*${stretch}+${offset}/TB[v${INPUT_IDX}]")
-                FILTER_PARTS+=("[${CUR_LABEL}][v${INPUT_IDX}]overlay=enable='between(t,${offset},${end})'[ov${INPUT_IDX}]")
-                CUR_LABEL="ov${INPUT_IDX}"
-              else
-                # Not a designated full-frame source (camera, or anything
-                # else that lands here): goes full-frame whenever it's
-                # active and nothing else is claiming the full frame at
-                # that moment, and shrinks to a small corner tile only
-                # during the sub-window(s) where it overlaps a genuine
-                # full-frame source (screen share / whiteboard). ffmpeg
-                # can't resize one overlay dynamically, so this needs two
-                # differently-scaled copies of the same input, each gated
-                # by the opposite half of that condition.
-                tile_w=320; tile_h=180; margin=10
-                tile_col=$(( i % 4 ))
-                x_expr="W-${tile_w}-${margin}-((${tile_col})*(${tile_w}+${margin}))"
-                y_expr="H-${tile_h}-${margin}"
-                FILTER_PARTS+=("[${INPUT_IDX}:v]split=2[cam${INPUT_IDX}tile][cam${INPUT_IDX}full]")
-                FILTER_PARTS+=("[cam${INPUT_IDX}tile]scale=${tile_w}:${tile_h}:force_original_aspect_ratio=decrease,setpts=(PTS-STARTPTS)*${stretch}+${offset}/TB[v${INPUT_IDX}t]")
-                FILTER_PARTS+=("[cam${INPUT_IDX}full]scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2,setpts=(PTS-STARTPTS)*${stretch}+${offset}/TB[v${INPUT_IDX}f]")
-                FILTER_PARTS+=("[${CUR_LABEL}][v${INPUT_IDX}t]overlay=x='${x_expr}':y='${y_expr}':enable='between(t,${offset},${end})*gt(${FS_SUM_EXPR},0)'[ov${INPUT_IDX}a]")
-                FILTER_PARTS+=("[ov${INPUT_IDX}a][v${INPUT_IDX}f]overlay=enable='between(t,${offset},${end})*lte(${FS_SUM_EXPR},0)'[ov${INPUT_IDX}]")
-                CUR_LABEL="ov${INPUT_IDX}"
-              fi
-              INPUT_IDX=$((INPUT_IDX + 1))
+            offset="${OFFSETS[$i]}"
+            stretch="${STRETCH[$i]}"
+            FFMPEG_INPUTS+=(-itsoffset "$offset" -i "${LOCAL_FILES[$i]}")
+
+            if [[ "$source_v" == "SCREEN_SHARE" || "$source_v" == "WHITEBOARD" ]]; then
+              FILTER_PARTS+=("[${INPUT_IDX}:v]scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2,setpts=(PTS-STARTPTS)*${stretch}+${offset}/TB[v${INPUT_IDX}]")
+              VLABEL_FULL[$i]="v${INPUT_IDX}"
+              IS_FS_SOURCE[$i]=1
+            else
+              # Not a designated full-frame source (camera, or anything
+              # else that lands here): goes full-frame whenever it's
+              # active and nothing else is claiming the full frame at
+              # that moment, and shrinks to a small corner tile only
+              # during the sub-window(s) where it overlaps a genuine
+              # full-frame source (screen share / whiteboard). ffmpeg
+              # can't resize one overlay dynamically, so this needs two
+              # differently-scaled copies of the same input, each gated
+              # by the opposite half of that condition. tile_col comes
+              # from a dedicated counter over camera-like tracks only -
+              # not the raw track index i, which mixes in audio tracks
+              # and would scatter/mis-position tiles as soon as track
+              # ordering shifted (e.g. an extra mic track before a camera).
+              tile_w=320; tile_h=180; margin=10
+              tile_col=$(( TILE_COUNTER % 4 ))
+              TILE_COUNTER=$((TILE_COUNTER + 1))
+              VLABEL_FULL[$i]="v${INPUT_IDX}f"
+              VLABEL_TILE[$i]="v${INPUT_IDX}t"
+              TILE_X[$i]="W-${tile_w}-${margin}-((${tile_col})*(${tile_w}+${margin}))"
+              TILE_Y[$i]="H-${tile_h}-${margin}"
+              IS_FS_SOURCE[$i]=0
+              FILTER_PARTS+=("[${INPUT_IDX}:v]split=2[cam${INPUT_IDX}tile][cam${INPUT_IDX}full]")
+              FILTER_PARTS+=("[cam${INPUT_IDX}tile]scale=${tile_w}:${tile_h}:force_original_aspect_ratio=decrease,setpts=(PTS-STARTPTS)*${stretch}+${offset}/TB[v${INPUT_IDX}t]")
+              FILTER_PARTS+=("[cam${INPUT_IDX}full]scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2,setpts=(PTS-STARTPTS)*${stretch}+${offset}/TB[v${INPUT_IDX}f]")
             fi
+            INPUT_IDX=$((INPUT_IDX + 1))
+          done
+
+          # Pass 2: composite in the order that actually keeps things
+          # visible - camera full-frame views first (lowest layer; mutually
+          # exclusive in time with the full-frame sources below by
+          # construction, so draw order between them never matters), then
+          # the full-frame sources themselves, then camera corner TILES
+          # last/on top so they're never painted over.
+          for i in "${!LOCAL_FILES[@]}"; do
+            [[ "${TYPES[$i]}" == "VIDEO" && "${IS_FS_SOURCE[$i]:-}" == "0" ]] || continue
+            offset="${OFFSETS[$i]}"
+            end=$(echo "$offset + ${STRETCHED_DURATIONS[$i]}" | bc)
+            FILTER_PARTS+=("[${CUR_LABEL}][${VLABEL_FULL[$i]}]overlay=enable='between(t,${offset},${end})*lte(${FS_SUM_EXPR},0)'[ovf${i}]")
+            CUR_LABEL="ovf${i}"
+          done
+          for i in "${!LOCAL_FILES[@]}"; do
+            [[ "${TYPES[$i]}" == "VIDEO" && "${IS_FS_SOURCE[$i]:-}" == "1" ]] || continue
+            offset="${OFFSETS[$i]}"
+            end=$(echo "$offset + ${STRETCHED_DURATIONS[$i]}" | bc)
+            FILTER_PARTS+=("[${CUR_LABEL}][${VLABEL_FULL[$i]}]overlay=enable='between(t,${offset},${end})'[ovs${i}]")
+            CUR_LABEL="ovs${i}"
+          done
+          for i in "${!LOCAL_FILES[@]}"; do
+            [[ "${TYPES[$i]}" == "VIDEO" && "${IS_FS_SOURCE[$i]:-}" == "0" ]] || continue
+            offset="${OFFSETS[$i]}"
+            end=$(echo "$offset + ${STRETCHED_DURATIONS[$i]}" | bc)
+            FILTER_PARTS+=("[${CUR_LABEL}][${VLABEL_TILE[$i]}]overlay=x='${TILE_X[$i]}':y='${TILE_Y[$i]}':enable='between(t,${offset},${end})*gt(${FS_SUM_EXPR},0)'[ovt${i}]")
+            CUR_LABEL="ovt${i}"
           done
           FINAL_VIDEO_LABEL="$CUR_LABEL"
 

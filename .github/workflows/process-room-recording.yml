@@ -31,11 +31,18 @@ on:
   # Two independent sweeps, told apart at runtime via github.event.schedule
   # (the exact cron string that fired) - see the two cleanup jobs below:
   #  - weekly: deletes long-untouched room markers/ objects in R2.
-  #  - daily: deletes recordings whose admin-configured retention period
-  #    (set when the session was scheduled) has elapsed.
+  #  - every 10 minutes: deletes recordings whose admin-configured
+  #    retention period (set when the session was scheduled, now as low
+  #    as 1 minute - see the Set-class-time form) has elapsed. Retention
+  #    can no longer only be measured in days, so this can't run just
+  #    once a day either, or a 1-hour retention could sit expired for up
+  #    to 23 hours before being reclaimed. Note GitHub Actions doesn't
+  #    guarantee cron precision - a scheduled run can lag its nominal
+  #    time by several minutes under load - so "every 10 minutes" means
+  #    "usually within ~10-20 minutes of expiry", not to-the-second.
   schedule:
     - cron: '17 3 * * 0'
-    - cron: '43 4 * * *'
+    - cron: '*/10 * * * *'
 
 permissions:
   contents: read
@@ -1483,19 +1490,21 @@ jobs:
     # Runs the delete-expired-recordings Edge Function, which deletes any
     # recording from Cloudflare R2 (and soft-deletes its `recordings` row)
     # once the retention period the admin set for that session at
-    # scheduling time ("Auto-delete recording from R2 after ___ days")
+    # scheduling time ("Auto-delete recording from R2 after ___ hrs/min")
     # has elapsed. register-recording already computes and stores that
     # expiry as `recordings.delete_after` (recorded_at + the schedule's
-    # recording_retention_days) at the moment each recording is
+    # recording_retention_minutes) at the moment each recording is
     # registered, so this job's Edge Function just deletes anything past
     # its own delete_after - see
-    # supabase/functions/delete-expired-recordings/index.ts.
+    # supabase/functions/delete-expired-recordings/index.ts. Runs every 10
+    # minutes (see the on.schedule comment above) now that retention can
+    # be as short as 1 minute.
     #
     # Told apart from the other two triggers the same way
     # cleanup_stale_markers is: a schedule firing only counts when it's
-    # the daily one, and a manual run only counts when room_id is blank
-    # and cleanup_target picked this job.
-    if: (github.event_name == 'schedule' && github.event.schedule == '43 4 * * *') || (github.event_name == 'workflow_dispatch' && github.event.inputs.room_id == '' && github.event.inputs.cleanup_target == 'expired_recordings')
+    # the every-10-minutes one, and a manual run only counts when
+    # room_id is blank and cleanup_target picked this job.
+    if: (github.event_name == 'schedule' && github.event.schedule == '*/10 * * * *') || (github.event_name == 'workflow_dispatch' && github.event.inputs.room_id == '' && github.event.inputs.cleanup_target == 'expired_recordings')
     runs-on: ubuntu-latest
     timeout-minutes: 15
     env:

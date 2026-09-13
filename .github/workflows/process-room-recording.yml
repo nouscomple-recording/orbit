@@ -31,18 +31,18 @@ on:
   # Two independent sweeps, told apart at runtime via github.event.schedule
   # (the exact cron string that fired) - see the two cleanup jobs below:
   #  - weekly: deletes long-untouched room markers/ objects in R2.
-  #  - every 10 minutes: deletes recordings whose admin-configured
+  #  - every 5 minutes: deletes recordings whose admin-configured
   #    retention period (set when the session was scheduled, now as low
   #    as 1 minute - see the Set-class-time form) has elapsed. Retention
   #    can no longer only be measured in days, so this can't run just
   #    once a day either, or a 1-hour retention could sit expired for up
   #    to 23 hours before being reclaimed. Note GitHub Actions doesn't
   #    guarantee cron precision - a scheduled run can lag its nominal
-  #    time by several minutes under load - so "every 10 minutes" means
-  #    "usually within ~10-20 minutes of expiry", not to-the-second.
+  #    time by several minutes under load - so "every 5 minutes" means
+  #    "usually within ~5-15 minutes of expiry", not to-the-second.
   schedule:
     - cron: '17 3 * * 0'
-    - cron: '*/10 * * * *'
+    - cron: '*/5 * * * *'
 
 permissions:
   contents: read
@@ -1496,7 +1496,7 @@ jobs:
     # recording_retention_minutes) at the moment each recording is
     # registered, so this job's Edge Function just deletes anything past
     # its own delete_after - see
-    # supabase/functions/delete-expired-recordings/index.ts. Runs every 10
+    # supabase/functions/delete-expired-recordings/index.ts. Runs every 5
     # minutes (see the on.schedule comment above) now that retention can
     # be as short as 1 minute.
     #

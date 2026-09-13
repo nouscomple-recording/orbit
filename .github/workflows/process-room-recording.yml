@@ -1504,7 +1504,7 @@ jobs:
     # cleanup_stale_markers is: a schedule firing only counts when it's
     # the every-10-minutes one, and a manual run only counts when
     # room_id is blank and cleanup_target picked this job.
-    if: (github.event_name == 'schedule' && github.event.schedule == '*/10 * * * *') || (github.event_name == 'workflow_dispatch' && github.event.inputs.room_id == '' && github.event.inputs.cleanup_target == 'expired_recordings')
+    if: (github.event_name == 'schedule' && github.event.schedule == '*/5 * * * *') || (github.event_name == 'workflow_dispatch' && github.event.inputs.room_id == '' && github.event.inputs.cleanup_target == 'expired_recordings')
     runs-on: ubuntu-latest
     timeout-minutes: 15
     env:

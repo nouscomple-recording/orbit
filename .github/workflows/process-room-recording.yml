@@ -6,43 +6,30 @@ on:
   workflow_dispatch:
     inputs:
       room_id:
-        description: 'PlugNmeet room_id to process (e.g. orbit-<schedule-id>). Leave blank to run one of the cleanup jobs instead (see cleanup_target below).'
+        description: 'PlugNmeet room_id to process (e.g. orbit-<schedule-id>). Leave blank to run the stale-marker cleanup job instead.'
         required: false
-      cleanup_target:
-        description: 'Manual cleanup run only (leave room_id blank): which cleanup to run'
-        required: false
-        default: 'stale_markers'
-        type: choice
-        options:
-          - stale_markers
-          - expired_recordings
       stale_marker_days:
-        description: 'Manual stale_markers cleanup only: delete a room''s last-processed marker if untouched for at least this many days'
+        description: 'Manual cleanup run only (leave room_id blank): delete a room''s last-processed marker if untouched for at least this many days'
         required: false
         default: '90'
-      recordings_dry_run:
-        description: 'Manual expired_recordings cleanup only: report what would be deleted without actually deleting anything from R2/the DB'
-        required: false
-        default: 'false'
-        type: choice
-        options:
-          - 'false'
-          - 'true'
-  # Two independent sweeps, told apart at runtime via github.event.schedule
-  # (the exact cron string that fired) - see the two cleanup jobs below:
-  #  - weekly: deletes long-untouched room markers/ objects in R2.
-  #  - every 5 minutes: deletes recordings whose admin-configured
-  #    retention period (set when the session was scheduled, now as low
-  #    as 1 minute - see the Set-class-time form) has elapsed. Retention
-  #    can no longer only be measured in days, so this can't run just
-  #    once a day either, or a 1-hour retention could sit expired for up
-  #    to 23 hours before being reclaimed. Note GitHub Actions doesn't
-  #    guarantee cron precision - a scheduled run can lag its nominal
-  #    time by several minutes under load - so "every 5 minutes" means
-  #    "usually within ~5-15 minutes of expiry", not to-the-second.
+  # Sweeps markers/ in R2 once a week and deletes the last-processed
+  # marker for any room that has not been processed (i.e. has not
+  # produced a single new recording) in a long time - see the cleanup
+  # job below for why these accumulate and why deleting them is safe.
+  #
+  # REMOVED: the every-5-minutes expired-recordings auto-delete sweep
+  # (cleanup_expired_recordings job + its cron + the delete-expired-
+  # recordings Edge Function) has been taken back out at the user's
+  # request - it was deleting recordings 5 minutes after their
+  # configured retention, which turned out to be unwanted. register-
+  # recording still computes and stores recordings.delete_after on every
+  # new recording (harmless, just unused now); nothing currently reads
+  # it or deletes anything because of it. To bring auto-delete back:
+  # redeploy the delete-expired-recordings Edge Function and re-add a
+  # cleanup_expired_recordings job + schedule entry mirroring
+  # cleanup_stale_markers below.
   schedule:
     - cron: '17 3 * * 0'
-    - cron: '*/5 * * * *'
 
 permissions:
   contents: read
@@ -1391,14 +1378,12 @@ jobs:
         run: rm -rf "${RUNNER_TEMP:?}"/orbit-*_* 2>/dev/null || true
 
   cleanup_stale_markers:
-    # Two schedules now share this workflow (see the `on.schedule` list
-    # above), so a schedule firing is only "run this job" when it's the
-    # weekly one - github.event.schedule carries the exact cron string
-    # that fired. A manual workflow_dispatch run means the same ONLY
-    # when room_id was left blank AND cleanup_target picked this job (a
-    # run with a room_id given is a normal single-room process request,
-    # handled by the `process` job instead).
-    if: (github.event_name == 'schedule' && github.event.schedule == '17 3 * * 0') || (github.event_name == 'workflow_dispatch' && github.event.inputs.room_id == '' && github.event.inputs.cleanup_target == 'stale_markers')
+    # The mirror image of the `process` job's condition above: a
+    # schedule firing always means "run the cleanup", and a manual
+    # workflow_dispatch run means the same ONLY when room_id was left
+    # blank (a run with a room_id given is a normal single-room
+    # process request, handled by the job above instead).
+    if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && github.event.inputs.room_id == '')
     runs-on: ubuntu-latest
     timeout-minutes: 15
     env:
@@ -1485,77 +1470,3 @@ jobs:
           done < <(echo "$MARKERS_JSON" | jq -c '.[]')
 
           log "==== done: deleted ${DELETED_COUNT} stale marker(s), kept ${KEPT_COUNT} ===="
-
-  cleanup_expired_recordings:
-    # Runs the delete-expired-recordings Edge Function, which deletes any
-    # recording from Cloudflare R2 (and soft-deletes its `recordings` row)
-    # once the retention period the admin set for that session at
-    # scheduling time ("Auto-delete recording from R2 after ___ hrs/min")
-    # has elapsed. register-recording already computes and stores that
-    # expiry as `recordings.delete_after` (recorded_at + the schedule's
-    # recording_retention_minutes) at the moment each recording is
-    # registered, so this job's Edge Function just deletes anything past
-    # its own delete_after - see
-    # supabase/functions/delete-expired-recordings/index.ts. Runs every 5
-    # minutes (see the on.schedule comment above) now that retention can
-    # be as short as 1 minute.
-    #
-    # Told apart from the other two triggers the same way
-    # cleanup_stale_markers is: a schedule firing only counts when it's
-    # the every-10-minutes one, and a manual run only counts when
-    # room_id is blank and cleanup_target picked this job.
-    if: (github.event_name == 'schedule' && github.event.schedule == '*/5 * * * *') || (github.event_name == 'workflow_dispatch' && github.event.inputs.room_id == '' && github.event.inputs.cleanup_target == 'expired_recordings')
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    env:
-      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
-      RECORDER_HOOK_SECRET: ${{ secrets.RECORDER_HOOK_SECRET }}
-      RECORDINGS_DRY_RUN: ${{ github.event.inputs.recordings_dry_run || 'false' }}
-    permissions:
-      contents: read
-    steps:
-      - name: Validate inputs
-        run: |
-          : "${SUPABASE_URL:?missing secret SUPABASE_URL}"
-          : "${RECORDER_HOOK_SECRET:?missing secret RECORDER_HOOK_SECRET}"
-          echo "Sweeping expired recordings (dry_run=${RECORDINGS_DRY_RUN})"
-
-      - name: Call delete-expired-recordings
-        shell: bash --noprofile --norc -uo pipefail {0}
-        run: |
-          log() { echo "[$(date -u +%H:%M:%S)] $*"; }
-          fail() { log "FATAL: $*"; exit 1; }
-
-          DRY_RUN_JSON="false"
-          [[ "${RECORDINGS_DRY_RUN}" == "true" ]] && DRY_RUN_JSON="true"
-
-          PAYLOAD=$(jq -n --argjson dry_run "$DRY_RUN_JSON" '{dry_run: $dry_run}')
-
-          log "calling delete-expired-recordings (dry_run=${DRY_RUN_JSON})..."
-          HTTP_STATUS=$(curl -sS -o /tmp/cleanup_response.json -w '%{http_code}' -X POST \
-            "${SUPABASE_URL}/functions/v1/delete-expired-recordings" \
-            -H "Content-Type: application/json" \
-            -H "x-hook-secret: ${RECORDER_HOOK_SECRET}" \
-            -d "$PAYLOAD") || fail "curl itself failed calling delete-expired-recordings"
-
-          RESPONSE=$(cat /tmp/cleanup_response.json)
-          log "HTTP ${HTTP_STATUS}: ${RESPONSE}"
-
-          if [[ "$HTTP_STATUS" != "200" ]] || ! jq -e '.ok == true' <<<"$RESPONSE" >/dev/null 2>&1; then
-            fail "delete-expired-recordings call failed (HTTP ${HTTP_STATUS}): ${RESPONSE}"
-          fi
-
-          CHECKED=$(jq -r '.checked // 0' <<<"$RESPONSE")
-          MATCHED=$(jq -r '.matched_to_a_schedule // 0' <<<"$RESPONSE")
-          NO_MATCH=$(jq -r '.skipped_no_retention_match // 0' <<<"$RESPONSE")
-          NOT_EXPIRED=$(jq -r '.skipped_not_expired // 0' <<<"$RESPONSE")
-          DELETED=$(jq -r '.deleted // 0' <<<"$RESPONSE")
-          WOULD_DELETE=$(jq -r '.would_delete // 0' <<<"$RESPONSE")
-          ERROR_COUNT=$(jq -r '(.errors // []) | length' <<<"$RESPONSE")
-
-          log "==== done: checked=${CHECKED} matched=${MATCHED} no_retention_match=${NO_MATCH} not_expired=${NOT_EXPIRED} deleted=${DELETED} would_delete=${WOULD_DELETE} errors=${ERROR_COUNT} ===="
-
-          if [[ "$ERROR_COUNT" != "0" ]]; then
-            log "per-item errors (non-fatal - these recordings were left untouched, safe to retry next run):"
-            jq -r '.errors[]' <<<"$RESPONSE" | while IFS= read -r e; do log "  - $e"; done
-          fi

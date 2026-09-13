@@ -1086,12 +1086,50 @@ jobs:
                 # else.
                 needs_correction=1
                 (( $(echo "${stretch#-} > 0.99" | bc -l) )) && (( $(echo "${stretch#-} < 1.01" | bc -l) )) && needs_correction=0
+
+                # ---- Actually delay this track within the mix ----
+                #
+                # Every earlier revision positioned an audio track by
+                # relabeling its timestamps (asetpts=PTS-STARTPTS+offset/TB)
+                # and relying on amix to place it in time accordingly. It
+                # doesn't: amix mixes each input purely by sample position -
+                # it starts summing from the first sample each input filter
+                # chain produces, with no regard for PTS at all. Retagging a
+                # stream's PTS as "starts at 104.964s" doesn't move a single
+                # sample of actual audio later - the real content still
+                # begins at the mix's sample 0, exactly as if offset had
+                # been 0. That's a different, more severe bug than the
+                # SCREEN_SHARE_AUDIO drift this pipeline already corrects
+                # for: instead of drifting a few seconds from its own video
+                # over time, the shared audio's entire ~47s of real content
+                # played from the very start of the recording, mixed on top
+                # of whatever else (mic, an earlier share) was already
+                # sounding at that time - exactly as reported ("audio is
+                # being played at the start and being mixed with earlier
+                # audio though it was played near the end"). Confirmed with
+                # a real ffmpeg run: an asetpts-delayed 1500Hz tone showed up
+                # at full strength at t=0 in the mixed output, not at its
+                # intended offset. The fix is `adelay`, which - unlike
+                # asetpts - inserts actual silent samples ahead of the real
+                # audio, so amix has real silence to sum against until the
+                # track's true content arrives. adelay's delay has to be in
+                # (integer) milliseconds and is measured on THIS stream's
+                # own timeline, so it goes after the atempo speed correction
+                # (which alters how long the real content itself takes) and
+                # uses the plain, unstretched offset - the same split
+                # video's setpts already keeps between "stretch the content"
+                # and "then place it after this fixed, real-time gap".
+                # `:all=1` applies the same delay to every channel
+                # regardless of whether this track is mono or stereo,
+                # instead of requiring one delay value per channel.
+                offset_ms=$(printf '%.0f' "$(echo "${OFFSETS[$i]} * 1000" | bc -l)")
+                (( offset_ms < 0 )) && offset_ms=0
                 if [[ "$needs_correction" -eq 1 ]]; then
                   atempo_target=$(echo "scale=6; 1 / $stretch" | bc)
                   atempo_chain=$(build_atempo_chain "$atempo_target")
-                  FILTER_PARTS+=("[${INPUT_IDX}:a]${audio_clean_chain}${atempo_chain},asetpts=PTS-STARTPTS+${OFFSETS[$i]}/TB[a${INPUT_IDX}p]")
+                  FILTER_PARTS+=("[${INPUT_IDX}:a]${audio_clean_chain}${atempo_chain},adelay=${offset_ms}:all=1[a${INPUT_IDX}p]")
                 else
-                  FILTER_PARTS+=("[${INPUT_IDX}:a]${audio_clean_chain}asetpts=PTS-STARTPTS+${OFFSETS[$i]}/TB[a${INPUT_IDX}p]")
+                  FILTER_PARTS+=("[${INPUT_IDX}:a]${audio_clean_chain}adelay=${offset_ms}:all=1[a${INPUT_IDX}p]")
                 fi
                 AUDIO_INPUT_LABELS+=("a${INPUT_IDX}p")
                 INPUT_IDX=$((INPUT_IDX + 1))

@@ -486,93 +486,74 @@ jobs:
               OFFSETS+=("$offset")
               DURATIONS+=("$dur")
 
-              # Compare this track's PROBED file duration against how much
-              # real wall-clock time LiveKit says actually elapsed between
-              # started_at and ended_at for this egress job. When a track's
-              # encoder stalled/dropped frames under CPU or bandwidth
-              # pressure (e.g. camera + whiteboard + screen share + mic all
-              # streaming from one machine at once), its file ends up
-              # covering only a fraction of the real time it was recorded
-              # over - exactly what produces audio/video drift, even though
-              # this track's *start* is aligned correctly. STRETCH[i] is the
-              # correction: how much to linearly stretch this track's own
-              # internal timeline so it occupies its true wall-clock span
-              # instead of a compressed one. STRETCHED_DURATIONS[i] is what
-              # that track will actually occupy in the final composite once
-              # that correction is applied, and is what everything
-              # downstream (total duration, overlay enable windows, the
-              # full-frame-active expression) must use instead of the raw
-              # probed duration.
+              # ---- Never change this track's own playback speed ----
+              #
+              # Earlier revisions compared this track's PROBED file
+              # duration against how much real wall-clock time LiveKit says
+              # elapsed between started_at and ended_at for its egress job,
+              # and treated any gap as encoder drift - "fixed" by literally
+              # changing the track's PLAYBACK SPEED (setpts/atempo) to
+              # stretch its content across the full wall-clock span.
+              # Measured directly against a real delivered recording
+              # (cross-correlating the finished video's own audio envelope
+              # against camera motion, frame by frame): a camera track
+              # stretched by a measured "drift" of 4.5% did not resync
+              # anything - the video fell increasingly further BEHIND its
+              # own audio the longer playback went on (about 1.2s late in
+              # the first half of the clip, about 1.6s late in the second
+              # half - almost exactly the 4.5% stretch itself, compounding
+              # over time). A gap that produces a worse result the more a
+              # speed correction is applied to it isn't a constant-rate
+              # clock mismatch in the first place - the mismatch is on the
+              # measurement side (LiveKit's own egress start/stop
+              # bookkeeping, or simply how long a presenter leaves
+              # something open after the last real change, padding
+              # wall_span with time that was never real content), not a
+              # camera/mic actually running fast or slow.
+              #
+              # So this track's own speed is never changed anymore.
+              # STRETCH[i] stays permanently "1" (every setpts/atempo
+              # expression downstream that multiplies by it is therefore a
+              # harmless no-op, left in place rather than torn out
+              # everywhere it's used, since an obviously-inert constant is
+              # far lower-risk than a larger rewrite). The only adjustment
+              # left is STRETCHED_DURATIONS[i]: this track is trusted to
+              # already be paced correctly and simply capped at whatever
+              # wall-clock span was actually available to it, so it can
+              # never be treated as running into the next track's own
+              # start time. Whatever's left over below that cap - because
+              # the real content simply ended first, same as a presenter
+              # actually turning their camera off or ending a share early -
+              # is filled the same way any other gap between full-frame
+              # sources already is (the HOLD mechanism below), or is simply
+              # the moment a camera/mic-like track stops being shown/heard.
               wall_span_note=""
               stretch_factor="1"
-              # Below this, a track is too short for the drift% to mean
-              # anything: LiveKit's own start/stop bookkeeping overhead (job
-              # spin-up/teardown, timestamp rounding) is typically a second
-              # or more, so on a sub-3s clip that overhead alone can look
-              # like a huge "drift" percentage even though nothing actually
-              # stalled. Stretching a clip that short by the resulting
-              # extreme factor (seen in practice: a 0.742s screen-share clip
-              # clamped to a 3x slowdown) is far more noticeable/jarring - a
-              # visible freeze-then-lurch - than the sub-second timing error
-              # it's supposedly fixing, so these are left uncorrected on
-              # purpose.
+              # Below this, wall_span itself is too short to be a reliable
+              # reference at all - LiveKit's own start/stop bookkeeping
+              # (job spin-up/teardown, timestamp rounding) is typically a
+              # second or more, so on a sub-3s clip that alone can look
+              # like a large mismatch with no real content gap behind it.
               MIN_DRIFT_CORRECTION_DURATION=3
-              # Beyond this, the mismatch is no longer "the recording clock
-              # ran a little fast/slow" - it means a real chunk of wall time
-              # has NO corresponding frames at all (the common real-world
-              # cause: a presenter's camera was genuinely switched off, not
-              # merely muted, for a big chunk of the session, so LiveKit's
-              # egress simply had nothing to encode during that span, and
-              # the probed file duration comes back far shorter than the
-              # wall-clock time the egress job actually ran for). Stretching
-              # a clip like that (previously clamped up to 3x) to fill its
-              # full wall-clock span turns a handful of real seconds of
-              # footage into extreme slow motion - every frame gets shown
-              # several times in a row, which looks exactly like the video
-              # "freezing" even though nothing is technically frozen, and it
-              # also drags out the reserved camera-column window (see
-              # CAMERA_VISIBLE_SUM_EXPR below) to match, keeping the column
-              # up long after the real footage in it has ended. The correct
-              # response to a gap this large isn't to slow footage down to
-              # fill it - it's to play the real footage at (near) its own
-              # natural speed and have nothing for the rest of the span,
-              # which also lets the camera column disappear again as soon
-              # as the real footage actually ends.
-              MAX_PLAUSIBLE_DRIFT_PCT=40
+              stretched_dur="$dur"
               if [[ "${C_ENDS[$i]}" != "0" && "${C_STARTS[$i]}" != "0" ]]; then
                 wall_span=$(echo "${C_ENDS[$i]} - ${C_STARTS[$i]}" | bc)
                 if (( $(echo "$wall_span > 0" | bc -l) )) && (( $(echo "$dur > 0" | bc -l) )); then
                   drift_pct=$(echo "scale=2; (($dur - $wall_span) / $wall_span) * 100" | bc)
-                  wall_span_note=" wall_span=${wall_span}s drift=${drift_pct}%"
+                  wall_span_note=" wall_span=${wall_span}s gap=${drift_pct}%"
                   if (( $(echo "$dur < $MIN_DRIFT_CORRECTION_DURATION" | bc -l) )) || (( $(echo "$wall_span < $MIN_DRIFT_CORRECTION_DURATION" | bc -l) )); then
-                    wall_span_note="${wall_span_note} <-- drift ignored: track too short (<${MIN_DRIFT_CORRECTION_DURATION}s) for a reliable drift estimate"
-                  # Only correct drift that's actually worth correcting - a
-                  # difference this small is more likely LiveKit timestamp
-                  # rounding/noise than real drift, and resampling a track
-                  # that doesn't need it only risks a small quality loss for
-                  # no sync benefit. stretch_factor stays "1" (no-op) below
-                  # this threshold.
-                  elif (( $(echo "${drift_pct#-} > $MAX_PLAUSIBLE_DRIFT_PCT" | bc -l) )); then
-                    wall_span_note="${wall_span_note} <-- drift too large to be clock/encoder skew (>${MAX_PLAUSIBLE_DRIFT_PCT}%) - treated as a genuine content gap instead of stretched into slow motion; playing at native speed"
-                  elif (( $(echo "${drift_pct#-} > 3" | bc -l) )); then
-                    raw_factor=$(echo "scale=6; $wall_span / $dur" | bc)
-                    # Clamp to a tight, plausible clock/encoder-skew range.
-                    # Anything that reaches this line is already guaranteed
-                    # inside roughly this range by the MAX_PLAUSIBLE_DRIFT_PCT
-                    # gate above - this clamp is only a defense-in-depth
-                    # safety net, not the primary control anymore.
-                    clamped_factor="$raw_factor"
-                    (( $(echo "$clamped_factor > 1.7" | bc -l) )) && clamped_factor="1.7"
-                    (( $(echo "$clamped_factor < 0.6" | bc -l) )) && clamped_factor="0.6"
-                    stretch_factor="$clamped_factor"
-                    wall_span_note="${wall_span_note} <-- drift detected, applying stretch factor ${stretch_factor}"
+                    wall_span_note="${wall_span_note} <-- too short for wall_span to be reliable; kept at its own native length"
+                  elif (( $(echo "$dur > $wall_span" | bc -l) )); then
+                    stretched_dur="$wall_span"
+                    wall_span_note="${wall_span_note} <-- ran past its own wall-clock span; trimmed to it, still at native speed"
+                  else
+                    wall_span_note="${wall_span_note} <-- kept at native speed (no longer stretched to fill the gap - see comment above)"
                   fi
                 fi
               else
                 wall_span_note=" wall_span=unavailable(no ended_at from LiveKit)"
               fi
               STRETCH+=("$stretch_factor")
-              stretched_dur=$(echo "scale=6; $dur * $stretch_factor" | bc)
               STRETCHED_DURATIONS+=("$stretched_dur")
 
               end=$(echo "$offset + $stretched_dur" | bc)
@@ -626,16 +607,18 @@ jobs:
               done
               if [[ "$best_j" != "-1" ]]; then
                 old_offset="${OFFSETS[$i]}"
-                old_stretch="${STRETCH[$i]}"
                 OFFSETS[$i]="${OFFSETS[$best_j]}"
                 STRETCH[$i]="${STRETCH[$best_j]}"
-                new_stretched_dur=$(echo "scale=6; ${DURATIONS[$i]} * ${STRETCH[$i]}" | bc)
-                STRETCHED_DURATIONS[$i]="$new_stretched_dur"
-                new_end=$(echo "${OFFSETS[$i]} + $new_stretched_dur" | bc)
+                # Copy the video's own (already speed-trusted, capped)
+                # rendered length directly rather than recomputing one from
+                # this audio track's own raw duration, so the two share
+                # not just the same start but the exact same window.
+                STRETCHED_DURATIONS[$i]="${STRETCHED_DURATIONS[$best_j]}"
+                new_end=$(echo "${OFFSETS[$i]} + ${STRETCHED_DURATIONS[$i]}" | bc)
                 if (( $(echo "$new_end > $TOTAL_DURATION" | bc -l) )); then
                   TOTAL_DURATION=$(echo "($new_end + 2) / 1" | bc)
                 fi
-                log "session $cluster_num track[$i] source=SCREEN_SHARE_AUDIO: locked to track[$best_j]'s timeline (offset ${old_offset}s->${OFFSETS[$i]}s, stretch ${old_stretch}->${STRETCH[$i]}) instead of its own independently-measured drift, so it can't drift apart from its own video over the length of the share"
+                log "session $cluster_num track[$i] source=SCREEN_SHARE_AUDIO: locked to track[$best_j]'s timeline (offset ${old_offset}s->${OFFSETS[$i]}s) - shares its video's exact window and native speed, instead of its own independently-measured gap"
               fi
             done
 

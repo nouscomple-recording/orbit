@@ -770,7 +770,12 @@ jobs:
             # between(offset,end) whenever no freeze is found, so a track
             # with no freeze behaves exactly as before this change.
             FREEZE_MIN_SECONDS=3
-            declare -a ACTIVE_EXPR=()
+            # Below MIN_LAYOUT_GAP_SECONDS, a gap between two surviving
+            # (non-frozen) windows of the SAME camera-like track is bridged
+            # over for LAYOUT purposes only (see LAYOUT_EXPR below) - it
+            # does not change when the camera's own picture is shown.
+            MIN_LAYOUT_GAP_SECONDS=6
+            declare -a ACTIVE_EXPR=() LAYOUT_EXPR=()
             for i in "${!C_LOCAL_FILES[@]}"; do
               [[ "${C_TYPES[$i]}" == "VIDEO" ]] || continue
               [[ "${C_SOURCES[$i]}" == "SCREEN_SHARE" || "${C_SOURCES[$i]}" == "WHITEBOARD" ]] && continue
@@ -781,6 +786,7 @@ jobs:
               dur="${DURATIONS[$i]}"
               default_end=$(echo "$offset + ${STRETCHED_DURATIONS[$i]}" | bc)
               ACTIVE_EXPR[$i]="between(t,${offset},${default_end})"
+              LAYOUT_EXPR[$i]="${ACTIVE_EXPR[$i]}"
 
               if [[ -z "$dur" ]] || (( $(echo "$dur <= 0" | bc -l) )); then
                 continue
@@ -820,7 +826,7 @@ jobs:
               # timeline time the same way the rest of this script already
               # does for the track as a whole (multiply by its own drift-
               # correction stretch factor, then add its offset).
-              declare -a TERMS=()
+              declare -a TERMS=() G_STARTS=() G_ENDS=()
               cursor="0"
               for fi in "${!FREEZE_STARTS[@]}"; do
                 fs="${FREEZE_STARTS[$fi]}"
@@ -829,6 +835,8 @@ jobs:
                   g_start=$(echo "$cursor * $stretch + $offset" | bc)
                   g_end=$(echo "$fs * $stretch + $offset" | bc)
                   TERMS+=("between(t,${g_start},${g_end})")
+                  G_STARTS+=("$g_start")
+                  G_ENDS+=("$g_end")
                 fi
                 cursor="$fe"
               done
@@ -836,17 +844,65 @@ jobs:
                 g_start=$(echo "$cursor * $stretch + $offset" | bc)
                 g_end=$(echo "$dur * $stretch + $offset" | bc)
                 TERMS+=("between(t,${g_start},${g_end})")
+                G_STARTS+=("$g_start")
+                G_ENDS+=("$g_end")
               fi
 
               if [[ "${#TERMS[@]}" -eq 0 ]]; then
                 # Frozen for its entire duration - never actually active.
                 ACTIVE_EXPR[$i]="0"
+                LAYOUT_EXPR[$i]="0"
               else
                 active_sum=$(IFS='+'; echo "${TERMS[*]}")
                 ACTIVE_EXPR[$i]="gt(${active_sum},0)"
+
+                # ---- Bridge short gaps for the LAYOUT decision only ----
+                #
+                # A presenter's camera can freeze and unfreeze more than
+                # once in quick succession (a flaky connection stuttering
+                # a few seconds at a time). Each of those freezes is
+                # correctly hidden above (ACTIVE_EXPR), but if the
+                # whiteboard/screen-share layout below reacts to every one
+                # of them individually, a handful of few-second freezes
+                # packed into under 20 real seconds makes the full-frame
+                # content repeatedly resize between narrow and wide (and
+                # the camera tile + its reserved column pop in and out)
+                # several times in a row - confirmed against a real
+                # session where two ~4s camera freezes 4-5s apart made the
+                # whiteboard flip narrow/wide/narrow/wide four times in
+                # about 12 seconds, reported as the screen-share and
+                # camera picture looking "distorted". Any gap shorter than
+                # MIN_LAYOUT_GAP_SECONDS between two surviving windows of
+                # THIS track is therefore bridged into one continuous
+                # window here, so a brief blip no longer flips the layout
+                # - the camera's own picture still correctly disappears
+                # for the real freeze either way, via ACTIVE_EXPR above,
+                # which this bridging never touches.
+                declare -a LAYOUT_STARTS=() LAYOUT_ENDS=()
+                for gi in "${!G_STARTS[@]}"; do
+                  gs="${G_STARTS[$gi]}"
+                  ge="${G_ENDS[$gi]}"
+                  if [[ "${#LAYOUT_STARTS[@]}" -gt 0 ]]; then
+                    last_idx=$(( ${#LAYOUT_ENDS[@]} - 1 ))
+                    gap=$(echo "$gs - ${LAYOUT_ENDS[$last_idx]}" | bc)
+                    if (( $(echo "$gap < $MIN_LAYOUT_GAP_SECONDS" | bc -l) )); then
+                      LAYOUT_ENDS[$last_idx]="$ge"
+                      continue
+                    fi
+                  fi
+                  LAYOUT_STARTS+=("$gs")
+                  LAYOUT_ENDS+=("$ge")
+                done
+                declare -a LAYOUT_TERMS=()
+                for gi in "${!LAYOUT_STARTS[@]}"; do
+                  LAYOUT_TERMS+=("between(t,${LAYOUT_STARTS[$gi]},${LAYOUT_ENDS[$gi]})")
+                done
+                layout_sum=$(IFS='+'; echo "${LAYOUT_TERMS[*]}")
+                LAYOUT_EXPR[$i]="gt(${layout_sum},0)"
+                unset LAYOUT_STARTS LAYOUT_ENDS LAYOUT_TERMS
               fi
 
-              unset FREEZE_STARTS FREEZE_ENDS TERMS
+              unset FREEZE_STARTS FREEZE_ENDS TERMS G_STARTS G_ENDS
             done
 
             # Whenever no camera is genuinely visible right now - because
@@ -868,7 +924,7 @@ jobs:
             for i in "${!C_LOCAL_FILES[@]}"; do
               [[ "${C_TYPES[$i]}" == "VIDEO" ]] || continue
               [[ "${C_SOURCES[$i]}" == "SCREEN_SHARE" || "${C_SOURCES[$i]}" == "WHITEBOARD" ]] && continue
-              CAMERA_VISIBLE_TERMS+=("${ACTIVE_EXPR[$i]}")
+              CAMERA_VISIBLE_TERMS+=("${LAYOUT_EXPR[$i]}")
             done
             if [[ "${#CAMERA_VISIBLE_TERMS[@]}" -eq 0 ]]; then
               CAMERA_VISIBLE_SUM_EXPR="0"

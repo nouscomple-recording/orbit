@@ -6,14 +6,29 @@ on:
   workflow_dispatch:
     inputs:
       room_id:
-        description: 'PlugNmeet room_id to process (e.g. orbit-<schedule-id>)'
-        required: true
+        description: 'PlugNmeet room_id to process (e.g. orbit-<schedule-id>). Leave blank to run the stale-marker cleanup job instead.'
+        required: false
+      stale_marker_days:
+        description: 'Manual cleanup run only (leave room_id blank): delete a room''s last-processed marker if untouched for at least this many days'
+        required: false
+        default: '90'
+  # Sweeps markers/ in R2 once a week and deletes the last-processed
+  # marker for any room that has not been processed (i.e. has not
+  # produced a single new recording) in a long time - see the cleanup
+  # job below for why these accumulate and why deleting them is safe.
+  schedule:
+    - cron: '17 3 * * 0'
 
 permissions:
   contents: read
 
 jobs:
   process:
+    # repository_dispatch always means "process this room". A manual
+    # workflow_dispatch run means the same ONLY if a room_id was
+    # actually given - leaving it blank is how a person triggers the
+    # cleanup job below by hand instead, so don't run this job then.
+    if: github.event_name == 'repository_dispatch' || (github.event_name == 'workflow_dispatch' && github.event.inputs.room_id != '')
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
@@ -1366,3 +1381,97 @@ jobs:
       - name: Clean up workdir
         if: always()
         run: rm -rf "${RUNNER_TEMP:?}"/orbit-*_* 2>/dev/null || true
+
+  cleanup_stale_markers:
+    # The mirror image of the `process` job's condition above: a
+    # schedule firing always means "run the cleanup", and a manual
+    # workflow_dispatch run means the same ONLY when room_id was left
+    # blank (a run with a room_id given is a normal single-room
+    # process request, handled by the job above instead).
+    if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && github.event.inputs.room_id == '')
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+      R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
+      STALE_MARKER_DAYS: ${{ github.event.inputs.stale_marker_days || '90' }}
+    permissions:
+      contents: read
+    steps:
+      - name: Validate inputs
+        run: |
+          : "${R2_ACCOUNT_ID:?missing secret R2_ACCOUNT_ID}"
+          : "${R2_ACCESS_KEY_ID:?missing secret R2_ACCESS_KEY_ID}"
+          : "${R2_SECRET_ACCESS_KEY:?missing secret R2_SECRET_ACCESS_KEY}"
+          : "${R2_BUCKET_NAME:?missing secret R2_BUCKET_NAME}"
+          echo "Sweeping stale room markers (>= ${STALE_MARKER_DAYS} days untouched)"
+
+      - name: Install rclone
+        run: sudo apt-get update -y && sudo apt-get install -y rclone
+
+      - name: Delete stale room markers
+        shell: bash --noprofile --norc -uo pipefail {0}
+        run: |
+          log() { echo "[$(date -u +%H:%M:%S)] $*"; }
+
+          WORKDIR="${RUNNER_TEMP}/marker_cleanup_$(date -u +%s)"
+          mkdir -p "$WORKDIR"
+
+          RCLONE_REMOTE="nouscomplex_r2_pipeline"
+          RCLONE_CONF="${WORKDIR}/rclone.conf"
+          cat > "$RCLONE_CONF" <<EOF
+          [$RCLONE_REMOTE]
+          type = s3
+          provider = Cloudflare
+          access_key_id = $R2_ACCESS_KEY_ID
+          secret_access_key = $R2_SECRET_ACCESS_KEY
+          endpoint = https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com
+          no_check_bucket = true
+          no_head = true
+          acl =
+          EOF
+          chmod 600 "$RCLONE_CONF"
+          rclone_() { rclone --config "$RCLONE_CONF" "$@"; }
+
+          # Each room's marker (markers/<room_id>/last_processed_ended_at.txt)
+          # is only ever rewritten when that room is actually reprocessed -
+          # see the marker comment near the top of the "process" job - so
+          # its own last-modified time in R2 IS the true "last time this
+          # room produced a new recording" signal, no separate bookkeeping
+          # needed. A room that hasn't touched its marker in a very long
+          # time (default 90 days) is either a one-off test room or a
+          # class that's genuinely done for good, so its marker is safe to
+          # delete: the worst case, if that room ID were ever somehow
+          # reused after that long, is a single harmless one-time full
+          # reprocess (LAST_PROCESSED_ENDED_AT resets to 0 for it) rather
+          # than any duplicate/corrupt output - it can never make an
+          # already-composited video wrong, only, at most, redo one.
+          CUTOFF_EPOCH=$(date -u -d "-${STALE_MARKER_DAYS} days" +%s)
+          log "cutoff: markers untouched since before $(date -u -d "@$CUTOFF_EPOCH" '+%Y-%m-%d %H:%M:%SZ') will be deleted"
+
+          MARKERS_JSON=$(rclone_ lsjson "${RCLONE_REMOTE}:${R2_BUCKET_NAME}/markers" --recursive 2>/dev/null || echo '[]')
+          TOTAL=$(echo "$MARKERS_JSON" | jq 'length')
+          log "found ${TOTAL} marker object(s) under markers/"
+
+          DELETED_COUNT=0
+          KEPT_COUNT=0
+          while IFS= read -r entry; do
+            [[ -z "$entry" ]] && continue
+            rel_path=$(echo "$entry" | jq -r '.Path')
+            modtime=$(echo "$entry" | jq -r '.ModTime')
+            mod_epoch=$(date -u -d "$modtime" +%s 2>/dev/null || echo 0)
+            if [[ "$mod_epoch" -gt 0 && "$mod_epoch" -lt "$CUTOFF_EPOCH" ]]; then
+              log "deleting stale marker: markers/${rel_path} (last touched ${modtime})"
+              if rclone_ deletefile "${RCLONE_REMOTE}:${R2_BUCKET_NAME}/markers/${rel_path}"; then
+                DELETED_COUNT=$((DELETED_COUNT + 1))
+              else
+                log "WARNING: failed to delete markers/${rel_path}"
+              fi
+            else
+              KEPT_COUNT=$((KEPT_COUNT + 1))
+            fi
+          done < <(echo "$MARKERS_JSON" | jq -c '.[]')
+
+          log "==== done: deleted ${DELETED_COUNT} stale marker(s), kept ${KEPT_COUNT} ===="

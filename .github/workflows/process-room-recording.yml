@@ -101,6 +101,36 @@ jobs:
           mkdir -p "$WORKDIR"
           log "workdir: $WORKDIR"
 
+          # ---- Branded background (instead of a flat navy screen) ----
+          #
+          # The composite's base layer used to be a plain solid-color
+          # canvas (see the FFMPEG_INPUTS line inside the session loop
+          # below) - whenever no camera/screen-share was active, viewers
+          # just saw an empty navy rectangle. Downloaded once here (not per
+          # session - the branding never changes within a run) and
+          # composited onto the navy canvas as a single static PNG, which
+          # the session loop below loops as its background input instead
+          # of the flat color. Falls back to the original plain color
+          # automatically if the logo can't be fetched or composited for
+          # any reason (network hiccup, bad image, etc.) - a branding
+          # nicety is never worth failing an entire recording over.
+          BACKGROUND_IMAGE=""
+          if curl -sSf --max-time 20 -o "${WORKDIR}/logo.png" "https://meet.nouscomplex.com/assets/nouscomplex.png"; then
+            if ffmpeg -y -hide_banner -loglevel warning -nostdin \
+                 -f lavfi -i "color=c=0x0e1c76:s=1280x720:d=1" \
+                 -i "${WORKDIR}/logo.png" \
+                 -filter_complex "[1:v]scale=600:600:force_original_aspect_ratio=decrease[logo];[0:v][logo]overlay=(W-w)/2:(H-h)/2:shortest=1[bg]" \
+                 -map "[bg]" -frames:v 1 "${WORKDIR}/background.png" </dev/null \
+               && [[ -s "${WORKDIR}/background.png" ]]; then
+              BACKGROUND_IMAGE="${WORKDIR}/background.png"
+              log "branded background image ready: ${BACKGROUND_IMAGE}"
+            else
+              log "WARNING: could not composite logo onto background - falling back to plain navy"
+            fi
+          else
+            log "WARNING: could not download logo - falling back to plain navy"
+          fi
+
           RCLONE_REMOTE="nouscomplex_r2_pipeline"
           RCLONE_CONF="${WORKDIR}/rclone.conf"
           cat > "$RCLONE_CONF" <<EOF
@@ -718,7 +748,11 @@ jobs:
               HOLD_DUR[$i]="$hold_dur"
             done
 
-            FFMPEG_INPUTS+=(-f lavfi -i "color=c=0x0e1c76:s=1280x720:r=30:d=${TOTAL_DURATION}")
+            if [[ -n "$BACKGROUND_IMAGE" ]]; then
+              FFMPEG_INPUTS+=(-loop 1 -r 30 -t "${TOTAL_DURATION}" -i "$BACKGROUND_IMAGE")
+            else
+              FFMPEG_INPUTS+=(-f lavfi -i "color=c=0x0e1c76:s=1280x720:r=30:d=${TOTAL_DURATION}")
+            fi
             CUR_LABEL="0:v"
 
             # Pass 1: register each video track's ffmpeg input and its

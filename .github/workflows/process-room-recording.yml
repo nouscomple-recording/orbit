@@ -120,7 +120,7 @@ jobs:
                  -f lavfi -i "color=c=0x0e1c76:s=1280x720:d=1" \
                  -i "${WORKDIR}/logo.png" \
                  -filter_complex "[1:v]scale=600:600:force_original_aspect_ratio=decrease[logo];[0:v][logo]overlay=(W-w)/2:(H-h)/2:shortest=1[bg]" \
-                 -map "[bg]" -frames:v 1 "${WORKDIR}/background.png" </dev/null \
+                 -map "[bg]" -frames:v 1 -update 1 "${WORKDIR}/background.png" </dev/null \
                && [[ -s "${WORKDIR}/background.png" ]]; then
               BACKGROUND_IMAGE="${WORKDIR}/background.png"
               log "branded background image ready: ${BACKGROUND_IMAGE}"
@@ -1102,6 +1102,23 @@ jobs:
               CUR_LABEL="ovt${i}"
             done
             FINAL_VIDEO_LABEL="$CUR_LABEL"
+
+            # FIX: "ffmpeg failed (exit 234)" / "Output with label '0:v' does
+            # not exist in any defined filter graph". CUR_LABEL starts out as
+            # "0:v" - the raw background input - and only becomes a real
+            # filter-graph label (ovf1, ovsn1, ...) once at least one video
+            # overlay has been chained onto it. A session with NO camera and
+            # NO screen-share/whiteboard track (e.g. audio-only: just a
+            # microphone track) never adds an overlay, so CUR_LABEL is still
+            # the bare stream "0:v" - and `-map "[0:v]"` (square brackets =
+            # "a filter-graph output label") points at a label that doesn't
+            # exist, aborting the whole run. Passing the background through
+            # a no-op filter gives it a real label to map, so an audio-only
+            # session produces a normal MP4 (branded background + audio).
+            if [[ "$FINAL_VIDEO_LABEL" == "0:v" ]]; then
+              FILTER_PARTS+=("[0:v]null[bgonly]")
+              FINAL_VIDEO_LABEL="bgonly"
+            fi
 
             AUDIO_INPUT_LABELS=()
             for i in "${!C_LOCAL_FILES[@]}"; do

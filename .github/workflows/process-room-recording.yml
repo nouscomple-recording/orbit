@@ -1335,7 +1335,7 @@ jobs:
 
             RECORDING_ID=$(python3 -c "import uuid;print(uuid.uuid4())")
             REGISTER_PAYLOAD=$(jq -n \
-              --arg room_id "$ROOM_ID" \
+              --arg room_id "${ROOM_ID/#olive-/orbit-}" \
               --arg recording_id "$RECORDING_ID" \
               --arg file_name "$FILE_NAME" \
               --arg r2_key "$R2_KEY" \

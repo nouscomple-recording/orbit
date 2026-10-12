@@ -54,6 +54,8 @@ jobs:
       LIVEKIT_HOST: ${{ secrets.LIVEKIT_HOST }}
       SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
       RECORDER_HOOK_SECRET: ${{ secrets.RECORDER_HOOK_SECRET }}
+      GROUP_NAME: ${{ github.event.client_payload.group_name }}
+      SCHEDULED_TIME: ${{ github.event.client_payload.scheduled_time }}
     steps:
       - name: Validate inputs
         run: |
@@ -74,8 +76,9 @@ jobs:
       - name: Install ffmpeg, rclone, bc (jq/curl/openssl/python3 already on runner)
         run: |
           sudo apt-get update -y
-          sudo apt-get install -y ffmpeg bc
+          sudo apt-get install -y ffmpeg bc python3-pil fonts-dejavu-core
           curl https://rclone.org/install.sh | sudo bash
+          python3 -c 'import PIL' || { echo '::error::missing python3-pil'; exit 1; }
           for bin in ffmpeg ffprobe rclone jq curl openssl python3 bc; do
             command -v "$bin" >/dev/null 2>&1 || { echo "::error::missing tool: $bin"; exit 1; }
           done
@@ -101,35 +104,523 @@ jobs:
           mkdir -p "$WORKDIR"
           log "workdir: $WORKDIR"
 
-          # ---- Branded background (instead of a flat navy screen) ----
+          # ---- Logo + layout script ----
+          # The logo is used for the white start screen and the tile avatars. If it can't be
+          # downloaded the layout falls back to the text NOUS - never worth failing a recording.
+          curl -sSf --max-time 20 -o "${WORKDIR}/logo.png" "https://meet.nouscomplex.com/assets/nouscomplex.png" || { rm -f "${WORKDIR}/logo.png"; log "WARNING: could not download logo - using text fallback"; }
+          cat > "${WORKDIR}/orbit_layout.py" <<'ORBIT_LAYOUT_PY'
+          #!/usr/bin/env python3
+          # Orbit recording layout: header (group + date + speaker), content box on the left (shared screen /
+          # whiteboard, otherwise the logo on white), and a column of participant tiles on the right
+          # (camera when on, logo avatar when off, name, mic state, speaking highlight).
           #
-          # The composite's base layer used to be a plain solid-color
-          # canvas (see the FFMPEG_INPUTS line inside the session loop
-          # below) - whenever no camera/screen-share was active, viewers
-          # just saw an empty navy rectangle. Downloaded once here (not per
-          # session - the branding never changes within a run) and
-          # composited onto the navy canvas as a single static PNG, which
-          # the session loop below loops as its background input instead
-          # of the flat color. Falls back to the original plain color
-          # automatically if the logo can't be fetched or composited for
-          # any reason (network hiccup, bad image, etc.) - a branding
-          # nicety is never worth failing an entire recording over.
-          BACKGROUND_IMAGE=""
-          if curl -sSf --max-time 20 -o "${WORKDIR}/logo.png" "https://meet.nouscomplex.com/assets/nouscomplex.png"; then
-            if ffmpeg -y -hide_banner -loglevel warning -nostdin \
-                 -f lavfi -i "color=c=0x0e1c76:s=1280x720:d=1" \
-                 -i "${WORKDIR}/logo.png" \
-                 -filter_complex "[1:v]scale=600:600:force_original_aspect_ratio=decrease[logo];[0:v][logo]overlay=(W-w)/2:(H-h)/2:shortest=1[bg]" \
-                 -map "[bg]" -frames:v 1 -update 1 "${WORKDIR}/background.png" </dev/null \
-               && [[ -s "${WORKDIR}/background.png" ]]; then
-              BACKGROUND_IMAGE="${WORKDIR}/background.png"
-              log "branded background image ready: ${BACKGROUND_IMAGE}"
-            else
-              log "WARNING: could not composite logo onto background - falling back to plain navy"
-            fi
-          else
-            log "WARNING: could not download logo - falling back to plain navy"
-          fi
+          # usage: orbit_layout.py MANIFEST WORKDIR TOTAL_DURATION START_IDX CLUSTER GROUP_NAME SCHEDULED_ISO FALLBACK_EPOCH
+          # MANIFEST lines (tab separated): key  file  source  type  offset  stretched_duration  duration
+          # prints one JSON object: {base_png, inputs[], filter_parts[], final_label, next_idx}
+          import sys, os, json, subprocess, re, datetime
+
+          from PIL import Image, ImageDraw, ImageFont
+
+          W, H = 1280, 720
+          FRAME = (6, 12, 40)
+          TILE_BG = (14, 20, 56)
+          WHITE = (255, 255, 255)
+          MUTED_TXT = (150, 165, 220)
+          GREEN = (34, 197, 94)
+          RED = (248, 113, 113)
+          HEAD_H = 48
+          CARD = (8, 56, 1032, 656)           # x, y, w, h  (content box)
+          COL_X, COL_W = 1048, 224            # tile column
+          TILE_H, GAP, MAX_TILES = 126, 6, 5
+          COL_Y, COL_H = 56, 656
+
+          manifest, workdir, total, start_idx, cluster, group_name, sched_iso, fallback_epoch = sys.argv[1:9]
+          total = float(total)
+          start_idx = int(start_idx)
+
+
+          def log(*a):
+              print('[layout]', *a, file=sys.stderr)
+
+
+          def font(size, bold=False):
+              for p in ('/usr/share/fonts/truetype/dejavu/DejaVuSans%s.ttf' % ('-Bold' if bold else ''),
+                        '/usr/share/fonts/truetype/freefont/FreeSans%s.ttf' % ('Bold' if bold else '')):
+                  try:
+                      return ImageFont.truetype(p, size)
+                  except Exception:
+                      pass
+              return ImageFont.load_default()
+
+
+          F_TITLE, F_DATE, F_NAME, F_SMALL, F_BIG = font(20, True), font(15), font(13, True), font(12), font(30, True)
+
+
+          def fit(draw, text, f, maxw):
+              if draw.textlength(text, font=f) <= maxw:
+                  return text
+              while text and draw.textlength(text + '…', font=f) > maxw:
+                  text = text[:-1]
+              return text + '…'
+
+
+          def num(s, d=0.0):
+              try:
+                  return float(s)
+              except Exception:
+                  return d
+
+
+          # ------------------------------------------------------------------ tracks
+          tracks = []
+          for line in open(manifest, encoding='utf-8'):
+              p = line.rstrip('\n').split('\t')
+              if len(p) < 7:
+                  continue
+              key, f, src, typ, off, sdur, dur = p[:7]
+              base = os.path.basename(key)
+              base = base.rsplit('.', 1)[0] if '.' in base else base
+              parts = base.split('__')
+              ident = parts[0]
+              name, host = '', False
+              if len(parts) >= 5 and parts[4]:
+                  host = parts[4][0] == 'H'
+                  try:
+                      name = bytes.fromhex(parts[4][1:]).decode('utf-8', 'replace').strip()
+                  except Exception:
+                      name = ''
+              tracks.append(dict(ident=ident, file=f, src=src, type=typ, off=num(off), sdur=num(sdur), dur=num(dur), name=name, host=host))
+
+          people = {}
+          for t in tracks:
+              if t['ident'].startswith('orbit-board-') or t['src'] == 'WHITEBOARD':
+                  continue
+              pp = people.setdefault(t['ident'], dict(ident=t['ident'], name='', host=False, speak=[]))
+              if t['name']:
+                  pp['name'] = t['name']
+              pp['host'] = pp['host'] or t['host']
+          for pp in people.values():
+              if not pp['name']:
+                  pp['name'] = ('Host' if pp['host'] else 'Guest ' + pp['ident'][:4])
+
+
+          # ------------------------------------------------------------------ audio activity (who speaks when)
+          def speaking_intervals(f, off):
+              r = subprocess.run(['ffmpeg', '-hide_banner', '-nostats', '-nostdin', '-i', f, '-vn', '-af',
+                                  'highpass=f=100,silencedetect=noise=-38dB:d=0.5', '-f', 'null', '-'],
+                                 capture_output=True, text=True, stdin=subprocess.DEVNULL)
+              err = r.stderr
+              dm = re.findall(r'Duration:\s*(\d+):(\d+):([\d.]+)', err)
+              dur = (int(dm[0][0]) * 3600 + int(dm[0][1]) * 60 + float(dm[0][2])) if dm else 0.0
+              sil, cur = [], None
+              for m in re.finditer(r'silence_(start|end):\s*(-?[\d.]+)', err):
+                  v = float(m.group(2))
+                  if m.group(1) == 'start':
+                      cur = max(v, 0.0)
+                  elif cur is not None:
+                      sil.append((cur, v))
+                      cur = None
+              if cur is not None:
+                  sil.append((cur, dur))
+              out, pos = [], 0.0
+              for a, b in sil:
+                  if a > pos:
+                      out.append([pos, a])
+                  pos = max(pos, b)
+              if dur > pos:
+                  out.append([pos, dur])
+              merged = []
+              for a, b in out:
+                  if merged and a - merged[-1][1] < 1.0:
+                      merged[-1][1] = b
+                  else:
+                      merged.append([a, b])
+              return [(off + a, off + b) for a, b in merged if b - a >= 0.4]
+
+
+          for t in tracks:
+              if t['src'] == 'MICROPHONE' and t['type'] == 'AUDIO' and t['ident'] in people:
+                  iv = speaking_intervals(t['file'], t['off'])
+                  people[t['ident']]['speak'] += iv
+                  log('mic', t['ident'][:8], people[t['ident']]['name'], '%d speaking interval(s)' % len(iv))
+
+
+          # ------------------------------------------------------------------ camera on-windows (freeze-trimmed)
+          def camera_windows(t):
+              off, end = t['off'], t['off'] + t['sdur']
+              wins = [(off, end)]
+              if t['dur'] <= 0:
+                  return wins
+              r = subprocess.run(['ffmpeg', '-hide_banner', '-nostats', '-nostdin', '-i', t['file'], '-vf', 'freezedetect=n=-60dB:d=3',
+                                  '-an', '-f', 'null', '-'], capture_output=True, text=True, stdin=subprocess.DEVNULL)
+              st = [float(x) for x in re.findall(r'freeze_start:\s*([\d.]+)', r.stderr)]
+              en = [float(x) for x in re.findall(r'freeze_end:\s*([\d.]+)', r.stderr)]
+              while len(en) < len(st):
+                  en.append(t['dur'])
+              wins, cur = [], 0.0
+              for a, b in zip(st, en):
+                  if a > cur:
+                      wins.append((off + cur, off + a))
+                  cur = max(cur, b)
+              if cur < t['dur']:
+                  wins.append((off + cur, off + t['dur']))
+              return [(a, min(b, end)) for a, b in wins if b - a > 0.05]
+
+
+          # ------------------------------------------------------------------ images / helpers
+          logo = None
+          lp = os.path.join(workdir, 'logo.png')
+          if os.path.exists(lp):
+              try:
+                  logo = Image.open(lp).convert('RGBA')
+              except Exception:
+                  logo = None
+
+
+          def paste_logo(img, cx, cy, maxw, maxh):
+              if logo is None:
+                  d = ImageDraw.Draw(img)
+                  tw = d.textlength('NOUS', font=F_BIG)
+                  d.text((cx - tw / 2, cy - 18), 'NOUS', font=F_BIG, fill=(14, 28, 118))
+                  return
+              r = min(maxw / logo.width, maxh / logo.height)
+              lg = logo.resize((max(1, int(logo.width * r)), max(1, int(logo.height * r))), Image.LANCZOS)
+              img.paste(lg, (int(cx - lg.width / 2), int(cy - lg.height / 2)), lg)
+
+
+          def corner_mask(img, box, radius):
+              x, y, w, h = box
+              m = Image.new('L', (w, h), 0)
+              ImageDraw.Draw(m).rounded_rectangle((0, 0, w - 1, h - 1), radius=radius, fill=255)
+              inv = Image.eval(m, lambda v: 255 - v)
+              img.paste(Image.new('RGBA', (w, h), FRAME + (255,)), (x, y), inv)
+
+
+          def mic_icon(d, x, y, state):
+              col = GREEN if state == 'on' else RED
+              d.rounded_rectangle((x + 5, y, x + 10, y + 9), radius=3, fill=col)
+              d.arc((x + 2, y + 3, x + 13, y + 13), 0, 180, fill=col, width=2)
+              d.line((x + 7, y + 13, x + 7, y + 16), fill=col, width=2)
+              d.line((x + 4, y + 16, x + 11, y + 16), fill=col, width=2)
+              if state != 'on':
+                  d.line((x + 1, y + 17, x + 14, y - 1), fill=col, width=2)
+
+
+          def date_text():
+              try:
+                  from zoneinfo import ZoneInfo
+                  if sched_iso:
+                      dt = datetime.datetime.fromisoformat(sched_iso.replace('Z', '+00:00'))
+                  else:
+                      dt = datetime.datetime.fromtimestamp(float(fallback_epoch), tz=datetime.timezone.utc)
+                  dt = dt.astimezone(ZoneInfo('Asia/Karachi'))
+                  return dt.strftime('%a %d %b %Y  ·  ') + dt.strftime('%I:%M %p').lstrip('0')
+              except Exception:
+                  return ''
+
+
+          DATE = date_text()
+          GROUP = (group_name or 'Orbit Live class').strip()
+
+          # ------------------------------------------------------------------ who / what is on screen, over time
+          order = sorted(people.values(), key=lambda p: (not p['host'], p['name'].lower()))
+          rank = {p['ident']: k for k, p in enumerate(order)}
+          FS_SRC = ('SCREEN_SHARE', 'WHITEBOARD')
+          share_tracks = sorted([t for t in tracks if t['type'] == 'VIDEO' and t['src'] in FS_SRC], key=lambda t: t['off'])
+          cam_tracks = [t for t in tracks if t['type'] == 'VIDEO' and t['src'] not in FS_SRC and t['ident'] in people]
+          for t in cam_tracks:
+              t['wins'] = camera_windows(t)
+
+
+          def inside(wins, x):
+              return any(a <= x < b for a, b in wins)
+
+
+          ev = {0.0, total}
+          for p in people.values():
+              for a, b in p['speak']:
+                  ev.update((a, b))
+          for t in cam_tracks:
+              for a, b in t['wins']:
+                  ev.update((a, b))
+          for t in share_tracks:
+              ev.update((t['off'], t['off'] + t['sdur']))
+          ev = sorted(min(max(x, 0.0), total) for x in ev)
+
+          segs, prev_feat = [], None
+          for a, b in zip(ev, ev[1:]):
+              if b - a < 0.04:
+                  continue
+              mid = (a + b) / 2
+              share = any(t['off'] <= mid < t['off'] + t['sdur'] for t in share_tracks)
+              camset = {t['ident'] for t in cam_tracks if inside(t['wins'], mid)}
+              spk = frozenset(i for i, p in people.items() if any(s <= mid < e for s, e in p['speak']))
+              if share:
+                  key = ('A',) if not camset else ('B',) + tuple(sorted(camset, key=lambda i: rank[i]))
+              else:
+                  key = ('C',)
+              # who fills the big area when nothing is shared: keep the current one while they still talk,
+              # else the next speaker with a camera on, else keep the last one (if camera still on), else host / first camera
+              feat = None
+              if prev_feat in camset and prev_feat in spk:
+                  feat = prev_feat
+              else:
+                  cand = sorted([i for i in spk if i in camset], key=lambda i: rank[i])
+                  if cand:
+                      feat = cand[0]
+                  elif prev_feat in camset:
+                      feat = prev_feat
+                  elif camset:
+                      feat = sorted(camset, key=lambda i: rank[i])[0]
+              prev_feat = feat if feat else prev_feat
+              segs.append(dict(a=a, b=b, key=key, spk=spk, feat=feat if key[0] == 'C' else None, camset=camset))
+          if not segs:
+              segs = [dict(a=0.0, b=total, key=('C',), spk=frozenset(), feat=None, camset=set())]
+
+
+          def stack_cells(plist):
+              ov = 0
+              if len(plist) > MAX_TILES:
+                  keep = MAX_TILES - 1
+                  ranked = sorted(plist, key=lambda p: (not p['host'], -sum(b - a for a, b in p['speak'])))
+                  chosen = {p['ident'] for p in ranked[:keep]}
+                  ov = len(plist) - keep
+                  plist = [p for p in plist if p['ident'] in chosen]
+              n = len(plist) + (1 if ov else 0)
+              stack_h = n * TILE_H + max(n - 1, 0) * GAP
+              y0 = COL_Y + max((COL_H - stack_h) // 2, 0)
+              cells = [(p, COL_X, y0 + k * (TILE_H + GAP), 0) for k, p in enumerate(plist)]
+              if ov:
+                  cells.append((None, COL_X, y0 + len(plist) * (TILE_H + GAP), ov))
+              return cells
+
+
+          _cells = {}
+
+
+          def cells_for(key):
+              if key not in _cells:
+                  if key[0] == 'C':
+                      _cells[key] = stack_cells(order)
+                  elif key[0] == 'B':
+                      _cells[key] = stack_cells([people[i] for i in key[1:]])
+                  else:
+                      _cells[key] = []
+              return _cells[key]
+
+
+          def card_for(key):
+              return (8, 56, 1264, 656) if key[0] == 'A' else CARD
+
+
+          def base_image(key):
+              img = Image.new('RGBA', (W, H), FRAME + (255,))
+              bd = ImageDraw.Draw(img)
+              cx, cy, cw, ch = card_for(key)
+              bd.rounded_rectangle((cx, cy, cx + cw - 1, cy + ch - 1), radius=12, fill=WHITE)
+              paste_logo(img, cx + cw / 2, cy + ch / 2, 420, 220)
+              for p, x, y, ov in cells_for(key):
+                  bd.rounded_rectangle((x, y, x + COL_W - 1, y + TILE_H - 1), radius=10, fill=TILE_BG)
+                  if p:
+                      d = 58
+                      ax, ay = x + COL_W // 2, y + TILE_H // 2 - 8
+                      bd.ellipse((ax - d // 2, ay - d // 2, ax + d // 2, ay + d // 2), fill=WHITE)
+                      paste_logo(img, ax, ay, d - 14, d - 22)
+                  else:
+                      t = '+%d' % ov
+                      bd.text((x + COL_W / 2 - bd.textlength(t, font=F_BIG) / 2, y + TILE_H / 2 - 24), t, font=F_BIG, fill=WHITE)
+                      t2 = 'more participants'
+                      bd.text((x + COL_W / 2 - bd.textlength(t2, font=F_SMALL) / 2, y + TILE_H / 2 + 14), t2, font=F_SMALL, fill=MUTED_TXT)
+              return img.convert('RGB')
+
+
+          def top_image(key, speaking):
+              img = Image.new('RGBA', (W, H), (0, 0, 0, 0))
+              corner_mask(img, card_for(key), 12)
+              for p, x, y, ov in cells_for(key):
+                  corner_mask(img, (x, y, COL_W, TILE_H), 10)
+              d = ImageDraw.Draw(img)
+              d.text((16, 11), fit(d, GROUP, F_TITLE, 420), font=F_TITLE, fill=WHITE)
+              right = W - 16
+              if DATE:
+                  tw = d.textlength(DATE, font=F_DATE)
+                  d.text((right - tw, 15), DATE, font=F_DATE, fill=MUTED_TXT)
+                  right -= tw + 20
+              if speaking:
+                  names = [people[i]['name'] for i in sorted(speaking, key=lambda i: rank[i]) if i in people]
+                  label = 'Speaking: ' + ', '.join(names[:2]) + (' +%d' % (len(names) - 2) if len(names) > 2 else '')
+                  label = fit(d, label, F_NAME, 360)
+                  tw = d.textlength(label, font=F_NAME)
+                  px = int(right - tw - 40)
+                  d.rounded_rectangle((px, 9, px + tw + 40, 39), radius=15, fill=(20, 60, 40), outline=GREEN, width=2)
+                  d.ellipse((px + 12, 20, px + 20, 28), fill=GREEN)
+                  d.text((px + 28, 15), label, font=F_NAME, fill=WHITE)
+              for p, x, y, ov in cells_for(key):
+                  if p is None:
+                      continue
+                  on = p['ident'] in speaking
+                  if on:
+                      d.rounded_rectangle((x, y, x + COL_W - 1, y + TILE_H - 1), radius=10, outline=GREEN, width=3)
+                  label = fit(d, p['name'] + (' (Host)' if p['host'] else ''), F_NAME, COL_W - 56)
+                  tw = d.textlength(label, font=F_NAME)
+                  bx, by = x + 8, y + TILE_H - 30
+                  d.rounded_rectangle((bx, by, bx + tw + 36, by + 22), radius=11, fill=(0, 0, 0, 190))
+                  mic_icon(d, bx + 8, by + 3, 'on' if on else 'off')
+                  d.text((bx + 26, by + 3), label, font=F_NAME, fill=WHITE)
+              return img
+
+
+          def write_concat(name, items, maker, ext_rgba):
+              cache, lines, last = {}, ['ffconcat version 1.0'], None
+              for a, b, k in items:
+                  if k not in cache:
+                      fn = os.path.join(workdir, 'layout_%s_%s_%d.png' % (name, cluster, len(cache)))
+                      maker(k).save(fn)
+                      cache[k] = fn
+                  lines.append("file '%s'" % cache[k])
+                  lines.append('duration %.3f' % (b - a))
+                  last = cache[k]
+              lines.append("file '%s'" % last)
+              lp_ = os.path.join(workdir, 'layout_%s_%s.ffconcat' % (name, cluster))
+              open(lp_, 'w').write('\n'.join(lines) + '\n')
+              return lp_, len(cache)
+
+
+          def merged(keyfn):
+              out = []
+              for s in segs:
+                  k = keyfn(s)
+                  if out and out[-1][2] == k:
+                      out[-1][1] = s['b']
+                  else:
+                      out.append([s['a'], s['b'], k])
+              return out
+
+
+          base_list, nb = write_concat('base', merged(lambda s: s['key']), base_image, False)
+          top_list, nt = write_concat('top', merged(lambda s: (s['key'], tuple(sorted(s['spk'])))), lambda k: top_image(k[0], frozenset(k[1])), True)
+          log('%d segment(s); %d base image(s), %d chrome image(s)' % (len(segs), nb, nt))
+
+
+          # ------------------------------------------------------------------ ffmpeg graph
+          def tfmt(v):
+              s = ('%.3f' % max(v, 0.0)).rstrip('0').rstrip('.')
+              return s if s else '0'
+
+
+          def add_win(lst, a, b):
+              if lst and abs(lst[-1][1] - a) < 1e-6:
+                  lst[-1][1] = b
+              else:
+                  lst.append([a, b])
+
+
+          def expr(wins):
+              return '+'.join('between(t,%s,%s)' % (tfmt(a), tfmt(b)) for a, b in wins)
+
+
+          # share tracks: windows for the narrow box (tiles beside it) and the wide box (no tiles)
+          share_uses = []
+          for t in share_tracks:
+              nar, wid = [], []
+              for s in segs:
+                  mid = (s['a'] + s['b']) / 2
+                  if t['off'] <= mid < t['off'] + t['sdur']:
+                      add_win(wid if s['key'][0] == 'A' else nar, s['a'], s['b'])
+              share_uses.append((t, nar, wid))
+
+          # camera tracks: big-area windows (featured speaker) and tile windows per tile position
+          cam_uses = []
+          for t in cam_tracks:
+              big, tiles = [], {}
+              for s in segs:
+                  mid = (s['a'] + s['b']) / 2
+                  if not inside(t['wins'], mid):
+                      continue
+                  if s['feat'] == t['ident']:
+                      add_win(big, s['a'], s['b'])
+                  for p, x, y, ov in cells_for(s['key']):
+                      if p and p['ident'] == t['ident']:
+                          add_win(tiles.setdefault((x, y), []), s['a'], s['b'])
+              if big or tiles:
+                  cam_uses.append((t, big, tiles))
+
+          inputs, parts = [], []
+          idx = start_idx
+          parts.append('[0:v]fps=30[bg]')
+          cur = 'bg'
+          n = 0
+
+
+          def chain(src_idx, off, uses_n, tag):
+              """setpts (+ split when the same track is drawn more than once); returns the list of source labels"""
+              parts.append('[%d:v]setpts=PTS-STARTPTS+%s/TB%s' % (src_idx, tfmt(off),
+                           ('[%s0]' % tag) if uses_n == 1 else ',split=%d%s' % (uses_n, ''.join('[%s%d]' % (tag, k) for k in range(uses_n)))))
+              return ['%s%d' % (tag, k) for k in range(uses_n)]
+
+
+          # 1) featured camera filling the big area
+          for t, big, tiles in cam_uses:
+              if not big:
+                  continue
+              inputs_needed = 1 + len(tiles)
+              t['_idx'] = idx
+              inputs += ['-itsoffset', tfmt(t['off']), '-i', t['file']]
+              labs = chain(idx, t['off'], inputs_needed, 'cs%d_' % n)
+              t['_labs'] = labs
+              lab = labs.pop(0)
+              parts.append('[%s]scale=%d:%d:force_original_aspect_ratio=decrease,pad=%d:%d:(ow-iw)/2:(oh-ih)/2:color=black[bg%d]' % (lab, CARD[2], CARD[3], CARD[2], CARD[3], n))
+              parts.append("[%s][bg%d]overlay=x=%d:y=%d:enable='%s'[ob%d]" % (cur, n, CARD[0], CARD[1], expr(big), n))
+              cur = 'ob%d' % n
+              idx += 1
+              n += 1
+
+          # 2) shared screen / whiteboard (narrow with tiles, wide without)
+          for t, nar, wid in share_uses:
+              k = (1 if nar else 0) + (1 if wid else 0)
+              if not k:
+                  continue
+              pad = 'white' if t['src'] == 'WHITEBOARD' else '0x0b1130'
+              inputs += ['-itsoffset', tfmt(t['off']), '-i', t['file']]
+              labs = chain(idx, t['off'], k, 'ss%d_' % n)
+              if nar:
+                  lab = labs.pop(0)
+                  parts.append('[%s]scale=%d:%d:force_original_aspect_ratio=decrease,pad=%d:%d:(ow-iw)/2:(oh-ih)/2:color=%s[sn%d]' % (lab, CARD[2], CARD[3], CARD[2], CARD[3], pad, n))
+                  parts.append("[%s][sn%d]overlay=x=%d:y=%d:enable='%s'[osn%d]" % (cur, n, CARD[0], CARD[1], expr(nar), n))
+                  cur = 'osn%d' % n
+              if wid:
+                  lab = labs.pop(0)
+                  parts.append('[%s]scale=1264:656:force_original_aspect_ratio=decrease,pad=1264:656:(ow-iw)/2:(oh-ih)/2:color=%s[sw%d]' % (lab, pad, n))
+                  parts.append("[%s][sw%d]overlay=x=8:y=56:enable='%s'[osw%d]" % (cur, n, expr(wid), n))
+                  cur = 'osw%d' % n
+              idx += 1
+              n += 1
+
+          # 3) camera tiles
+          for t, big, tiles in cam_uses:
+              if not tiles:
+                  continue
+              if big:
+                  labs = t['_labs']            # already split in step 1 (first label used for the big copy)
+              else:
+                  inputs += ['-itsoffset', tfmt(t['off']), '-i', t['file']]
+                  labs = chain(idx, t['off'], len(tiles), 'ct%d_' % n)
+                  idx += 1
+              for (x, y), wins in tiles.items():
+                  lab = labs.pop(0)
+                  parts.append('[%s]scale=%d:%d:force_original_aspect_ratio=decrease,pad=%d:%d:(ow-iw)/2:(oh-ih)/2:color=black[tc%d]' % (lab, COL_W, TILE_H, COL_W, TILE_H, n))
+                  parts.append("[%s][tc%d]overlay=x=%d:y=%d:enable='%s'[otc%d]" % (cur, n, x, y, expr(wins), n))
+                  cur = 'otc%d' % n
+                  n += 1
+
+          # 4) header / names / mic icons / speaking highlight on top
+          inputs += ['-f', 'concat', '-safe', '0', '-i', top_list]
+          parts.append('[%d:v]format=rgba[topc]' % idx)
+          parts.append('[%s][topc]overlay=x=0:y=0:format=auto[vout]' % cur)
+          idx += 1
+
+          print(json.dumps(dict(base_list=base_list, inputs=inputs, filter_parts=parts, final_label='vout', next_idx=idx)))
+          ORBIT_LAYOUT_PY
 
           RCLONE_REMOTE="nouscomplex_r2_pipeline"
           RCLONE_CONF="${WORKDIR}/rclone.conf"
@@ -493,9 +984,10 @@ jobs:
               [[ "${CLUSTER_OF[$i]}" == "$cluster_num" ]] && CL_IDX+=("$i")
             done
 
-            declare -a C_LOCAL_FILES=() C_SOURCES=() C_TYPES=() C_STARTS=() C_ENDS=()
+            declare -a C_LOCAL_FILES=() C_SOURCES=() C_TYPES=() C_STARTS=() C_ENDS=() C_KEYS=()
             for i in "${CL_IDX[@]}"; do
               C_LOCAL_FILES+=("${LOCAL_FILES[$i]}")
+              C_KEYS+=("${RAW_KEYS[$i]}")
               C_SOURCES+=("${SOURCES[$i]}")
               C_TYPES+=("${TYPES[$i]}")
               C_STARTS+=("${STARTS[$i]}")
@@ -664,461 +1156,28 @@ jobs:
               fi
             done
 
-            # Pre-pass: collect every SCREEN_SHARE/WHITEBOARD ("full-frame")
-            # video track's own active window (using its STRETCHED duration,
-            # since that's how long it actually plays in the composite), so
-            # any OTHER video track (in practice: camera) can tell, at any
-            # moment t, whether something else already legitimately owns
-            # the full frame. FS_SUM_EXPR evaluates to >0 at any instant
-            # when at least one full-frame source is active, 0 otherwise (0
-            # permanently if there are no full-frame sources in this
-            # session).
-            FS_TERMS=()
-            for i in "${!C_LOCAL_FILES[@]}"; do
-              if [[ "${C_TYPES[$i]}" == "VIDEO" && ( "${C_SOURCES[$i]}" == "SCREEN_SHARE" || "${C_SOURCES[$i]}" == "WHITEBOARD" ) ]]; then
-                fs_offset="${OFFSETS[$i]}"
-                fs_end=$(echo "${OFFSETS[$i]} + ${STRETCHED_DURATIONS[$i]}" | bc)
-                FS_TERMS+=("between(t,${fs_offset},${fs_end})")
-              fi
-            done
-            if [[ "${#FS_TERMS[@]}" -eq 0 ]]; then
-              FS_SUM_EXPR="0"
-            else
-              FS_SUM_EXPR=$(IFS='+'; echo "${FS_TERMS[*]}")
-            fi
-            log "session $cluster_num full-frame-active expression: $FS_SUM_EXPR"
-
-            # ---- Hold the last frame of a full-frame source through any
-            # gap that follows it, instead of cutting to the bare navy
-            # background ----
-            #
-            # Whenever a screen share/whiteboard ended (or was paused and
-            # re-shared later, producing a separate egress track with a gap
-            # in between) and nothing else was active yet, the composite
-            # used to fall straight through to the plain color background -
-            # sometimes for tens of seconds at a time, audio still playing
-            # underneath - which reads as broken/glitchy rather than a
-            # deliberate blank moment (this is what was reported as "screen
-            # sharing isn't looking fine"). A real recording studio would
-            # hold the last slide/frame on a frozen "slate" until the next
-            # thing begins instead of cutting to black, so that's what this
-            # does: each full-frame source's hold window runs from its own
-            # end until the NEXT full-frame source begins (or the end of
-            # the session, if it's the last one) - but a genuine live
-            # camera instant (per CAMERA_VISIBLE_SUM_EXPR) always wins over
-            # a frozen slate, so the hold is gated to only show while no
-            # camera is visible either. This deliberately does NOT apply to
-            # camera tracks themselves - holding a frozen camera frame
-            # during a real camera gap is exactly the earlier "static photo
-            # sitting in the corner/full frame" bug the freeze-detection
-            # logic above exists to eliminate, so a camera gap still
-            # correctly shows nothing rather than a stale face.
-            declare -A HOLD_END HOLD_DUR
-            declare -a FS_IDX_SORTED=()
-            for i in "${!C_LOCAL_FILES[@]}"; do
-              [[ "${C_TYPES[$i]}" == "VIDEO" && ( "${C_SOURCES[$i]}" == "SCREEN_SHARE" || "${C_SOURCES[$i]}" == "WHITEBOARD" ) ]] || continue
-              FS_IDX_SORTED+=("$i")
-            done
-            # Insertion sort by OFFSETS - the number of full-frame tracks in
-            # one session is always tiny, so simplicity wins over speed.
-            for ((a=1; a<${#FS_IDX_SORTED[@]}; a++)); do
-              key="${FS_IDX_SORTED[$a]}"
-              key_off="${OFFSETS[$key]}"
-              b=$((a-1))
-              while [[ $b -ge 0 ]] && (( $(echo "${OFFSETS[${FS_IDX_SORTED[$b]}]} > $key_off" | bc -l) )); do
-                FS_IDX_SORTED[$((b+1))]="${FS_IDX_SORTED[$b]}"
-                b=$((b-1))
-              done
-              FS_IDX_SORTED[$((b+1))]="$key"
-            done
-            for idx in "${!FS_IDX_SORTED[@]}"; do
-              i="${FS_IDX_SORTED[$idx]}"
-              own_end=$(echo "${OFFSETS[$i]} + ${STRETCHED_DURATIONS[$i]}" | bc)
-              next_pos=$((idx+1))
-              if [[ "$next_pos" -lt "${#FS_IDX_SORTED[@]}" ]]; then
-                next_i="${FS_IDX_SORTED[$next_pos]}"
-                hold_end="${OFFSETS[$next_i]}"
-              else
-                hold_end="$TOTAL_DURATION"
-              fi
-              (( $(echo "$hold_end < $own_end" | bc -l) )) && hold_end="$own_end"
-              hold_dur=$(echo "$hold_end - $own_end" | bc)
-              (( $(echo "$hold_dur < 0" | bc -l) )) && hold_dur=0
-              HOLD_END[$i]="$hold_end"
-              HOLD_DUR[$i]="$hold_dur"
-            done
-
-            if [[ -n "$BACKGROUND_IMAGE" ]]; then
-              FFMPEG_INPUTS+=(-loop 1 -r 30 -t "${TOTAL_DURATION}" -i "$BACKGROUND_IMAGE")
-            else
-              FFMPEG_INPUTS+=(-f lavfi -i "color=c=0x0e1c76:s=1280x720:r=30:d=${TOTAL_DURATION}")
-            fi
-            CUR_LABEL="0:v"
-
-            # Pass 1: register each video track's ffmpeg input and its
-            # scale/split filter stage(s) only - no compositing (overlay)
-            # yet. Compositing order matters and is handled separately in
-            # pass 2 below, because a full-frame source (screen
-            # share/whiteboard) is fully opaque: if a camera's small corner
-            # TILE were drawn onto the canvas *before* the full-frame
-            # source, the full-frame layer drawn on top afterwards would
-            # completely paint over it and the tile would never actually be
-            # visible - exactly the bug found by inspecting a real
-            # composite frame during a screen-share window and finding no
-            # camera tile there at all, even though the tile's own
-            # enable/timing logic looked correct on paper.
-            # A screen share/whiteboard used to be scaled to the FULL
-            # 1280x720 canvas, with camera tiles overlaid in a bottom-right
-            # corner on top of it - which meant the tiles could sit right on
-            # top of real content (e.g. the bottom of a shared PDF/slide),
-            # visually interrupting the share. Whenever a full-frame source
-            # is active AND a camera is genuinely visible at that same
-            # instant, it's now confined to a fixed CONTENT BOX on the left
-            # (960px wide, full height) and the camera renders as a small
-            # tile in a dedicated COLUMN on the right (the remaining 320px)
-            # instead - the two regions never overlap, so a camera tile can
-            # never cover any part of the shared content.
-            #
-            # That column is only worth reserving if a camera could
-            # actually appear in it right now - see CAMERA_VISIBLE_SUM_EXPR
-            # further below for the full reasoning and how that's decided.
-            # The column is only ever drawn into when a camera tile is
-            # actually being placed there (the "else" branch of the Pass 1
-            # loop below), which only happens for a genuine camera-like
-            # track - so these themselves can just be fixed constants.
-            TILE_COL_X=960
-            TILE_COL_W=$((1280 - TILE_COL_X))
-
-            # ---- Detect within-track freezes on camera-like tracks ----
-            #
-            # A track's [offset, offset+duration] window was always treated
-            # as continuously live for its whole span. That's wrong when a
-            # participant disables their camera without LiveKit actually
-            # ending the egress track: the recording just keeps going with
-            # whatever the last real frame was repeated for however long
-            # the camera stays off (confirmed independently by ffmpeg's own
-            # "More than N frames duplicated" warning seen in practice when
-            # normalizing such a file to constant fps), and the composite
-            # then shows that stale frame as if it were live video - a
-            # static "photo" sitting in the corner tile or full-frame view
-            # for however long the freeze lasts, not a blank/no-camera
-            # state. This detection is deliberately ONLY applied to
-            # camera-like tracks, never to SCREEN_SHARE/WHITEBOARD ones: a
-            # presenter not actively drawing or scrolling for a while is
-            # normal, expected stillness, not a bug, and hiding a merely-
-            # quiet screen share would itself be wrong.
-            #
-            # ACTIVE_EXPR[i] holds the ffmpeg boolean expression (in terms
-            # of `t`, the global composite timeline) for when this track
-            # should actually be shown. It defaults to the original plain
-            # between(offset,end) whenever no freeze is found, so a track
-            # with no freeze behaves exactly as before this change.
-            FREEZE_MIN_SECONDS=3
-            # Below MIN_LAYOUT_GAP_SECONDS, a gap between two surviving
-            # (non-frozen) windows of the SAME camera-like track is bridged
-            # over for LAYOUT purposes only (see LAYOUT_EXPR below) - it
-            # does not change when the camera's own picture is shown.
-            MIN_LAYOUT_GAP_SECONDS=6
-            declare -a ACTIVE_EXPR=() LAYOUT_EXPR=()
-            for i in "${!C_LOCAL_FILES[@]}"; do
-              [[ "${C_TYPES[$i]}" == "VIDEO" ]] || continue
-              [[ "${C_SOURCES[$i]}" == "SCREEN_SHARE" || "${C_SOURCES[$i]}" == "WHITEBOARD" ]] && continue
-
-              f="${C_LOCAL_FILES[$i]}"
-              offset="${OFFSETS[$i]}"
-              stretch="${STRETCH[$i]}"
-              dur="${DURATIONS[$i]}"
-              default_end=$(echo "$offset + ${STRETCHED_DURATIONS[$i]}" | bc)
-              ACTIVE_EXPR[$i]="between(t,${offset},${default_end})"
-              LAYOUT_EXPR[$i]="${ACTIVE_EXPR[$i]}"
-
-              if [[ -z "$dur" ]] || (( $(echo "$dur <= 0" | bc -l) )); then
-                continue
-              fi
-
-              FREEZE_LOG="${WORKDIR}/freezedetect_${cluster_num}_${i}.log"
-              ffmpeg -hide_banner -nostats -nostdin -i "$f" \
-                -vf "freezedetect=n=-60dB:d=${FREEZE_MIN_SECONDS}" -an -f null - \
-                > "$FREEZE_LOG" 2>&1 </dev/null || true
-
-              declare -a FREEZE_STARTS=() FREEZE_ENDS=()
-              while IFS= read -r fzline; do
-                if [[ "$fzline" =~ freeze_start:\ ([0-9.]+) ]]; then
-                  FREEZE_STARTS+=("${BASH_REMATCH[1]}")
-                elif [[ "$fzline" =~ freeze_end:\ ([0-9.]+) ]]; then
-                  FREEZE_ENDS+=("${BASH_REMATCH[1]}")
-                fi
-              done < "$FREEZE_LOG"
-
-              if [[ "${#FREEZE_STARTS[@]}" -eq 0 ]]; then
-                unset FREEZE_STARTS FREEZE_ENDS
-                continue
-              fi
-
-              # A freeze still ongoing when the file ends emits a
-              # freeze_start with no matching freeze_end - treat that as
-              # frozen through the end of the track's own duration.
-              while [[ "${#FREEZE_ENDS[@]}" -lt "${#FREEZE_STARTS[@]}" ]]; do
-                FREEZE_ENDS+=("$dur")
-              done
-
-              log "session $cluster_num track[$i] source=${C_SOURCES[$i]}: ${#FREEZE_STARTS[@]} freeze period(s) detected (>=${FREEZE_MIN_SECONDS}s each) - will be hidden instead of shown as a static frame"
-
-              # Walk local (pre-stretch) track time from 0 to dur, cut out
-              # each detected [freeze_start,freeze_end) window, and convert
-              # each surviving live sub-range into global composite-
-              # timeline time the same way the rest of this script already
-              # does for the track as a whole (multiply by its own drift-
-              # correction stretch factor, then add its offset).
-              declare -a TERMS=() G_STARTS=() G_ENDS=()
-              cursor="0"
-              for fi in "${!FREEZE_STARTS[@]}"; do
-                fs="${FREEZE_STARTS[$fi]}"
-                fe="${FREEZE_ENDS[$fi]}"
-                if (( $(echo "$fs > $cursor" | bc -l) )); then
-                  g_start=$(echo "$cursor * $stretch + $offset" | bc)
-                  g_end=$(echo "$fs * $stretch + $offset" | bc)
-                  TERMS+=("between(t,${g_start},${g_end})")
-                  G_STARTS+=("$g_start")
-                  G_ENDS+=("$g_end")
-                fi
-                cursor="$fe"
-              done
-              if (( $(echo "$cursor < $dur" | bc -l) )); then
-                g_start=$(echo "$cursor * $stretch + $offset" | bc)
-                g_end=$(echo "$dur * $stretch + $offset" | bc)
-                TERMS+=("between(t,${g_start},${g_end})")
-                G_STARTS+=("$g_start")
-                G_ENDS+=("$g_end")
-              fi
-
-              if [[ "${#TERMS[@]}" -eq 0 ]]; then
-                # Frozen for its entire duration - never actually active.
-                ACTIVE_EXPR[$i]="0"
-                LAYOUT_EXPR[$i]="0"
-              else
-                active_sum=$(IFS='+'; echo "${TERMS[*]}")
-                ACTIVE_EXPR[$i]="gt(${active_sum},0)"
-
-                # ---- Bridge short gaps for the LAYOUT decision only ----
-                #
-                # A presenter's camera can freeze and unfreeze more than
-                # once in quick succession (a flaky connection stuttering
-                # a few seconds at a time). Each of those freezes is
-                # correctly hidden above (ACTIVE_EXPR), but if the
-                # whiteboard/screen-share layout below reacts to every one
-                # of them individually, a handful of few-second freezes
-                # packed into under 20 real seconds makes the full-frame
-                # content repeatedly resize between narrow and wide (and
-                # the camera tile + its reserved column pop in and out)
-                # several times in a row - confirmed against a real
-                # session where two ~4s camera freezes 4-5s apart made the
-                # whiteboard flip narrow/wide/narrow/wide four times in
-                # about 12 seconds, reported as the screen-share and
-                # camera picture looking "distorted". Any gap shorter than
-                # MIN_LAYOUT_GAP_SECONDS between two surviving windows of
-                # THIS track is therefore bridged into one continuous
-                # window here, so a brief blip no longer flips the layout
-                # - the camera's own picture still correctly disappears
-                # for the real freeze either way, via ACTIVE_EXPR above,
-                # which this bridging never touches.
-                declare -a LAYOUT_STARTS=() LAYOUT_ENDS=()
-                for gi in "${!G_STARTS[@]}"; do
-                  gs="${G_STARTS[$gi]}"
-                  ge="${G_ENDS[$gi]}"
-                  if [[ "${#LAYOUT_STARTS[@]}" -gt 0 ]]; then
-                    last_idx=$(( ${#LAYOUT_ENDS[@]} - 1 ))
-                    gap=$(echo "$gs - ${LAYOUT_ENDS[$last_idx]}" | bc)
-                    if (( $(echo "$gap < $MIN_LAYOUT_GAP_SECONDS" | bc -l) )); then
-                      LAYOUT_ENDS[$last_idx]="$ge"
-                      continue
-                    fi
-                  fi
-                  LAYOUT_STARTS+=("$gs")
-                  LAYOUT_ENDS+=("$ge")
-                done
-                declare -a LAYOUT_TERMS=()
-                for gi in "${!LAYOUT_STARTS[@]}"; do
-                  LAYOUT_TERMS+=("between(t,${LAYOUT_STARTS[$gi]},${LAYOUT_ENDS[$gi]})")
-                done
-                layout_sum=$(IFS='+'; echo "${LAYOUT_TERMS[*]}")
-                LAYOUT_EXPR[$i]="gt(${layout_sum},0)"
-                unset LAYOUT_STARTS LAYOUT_ENDS LAYOUT_TERMS
-              fi
-
-              unset FREEZE_STARTS FREEZE_ENDS TERMS G_STARTS G_ENDS
-            done
-
-            # Whenever no camera is genuinely visible right now - because
-            # this session never had one, the presenter has it switched
-            # off at this instant, or it's currently in a detected freeze -
-            # there's no camera column to keep clear, so a whiteboard/
-            # screen-share should use the entire 1280x720 canvas instead of
-            # being confined to the narrower 960 content box. This is a
-            # deliberate change from treating that as a one-time
-            # per-session decision: reserving the column for an entire
-            # session just because a camera was on for a moment (or is
-            # frozen and effectively invisible) left a permanent, unused
-            # navy strip next to full-width content the rest of the time -
-            # exactly what was reported. The trade-off is that the layout
-            # can now visibly resize whenever the presenter's camera
-            # actually toggles, which is judged the lesser issue versus
-            # wasting a quarter of the frame on an empty column.
-            declare -a CAMERA_VISIBLE_TERMS=()
-            for i in "${!C_LOCAL_FILES[@]}"; do
-              [[ "${C_TYPES[$i]}" == "VIDEO" ]] || continue
-              [[ "${C_SOURCES[$i]}" == "SCREEN_SHARE" || "${C_SOURCES[$i]}" == "WHITEBOARD" ]] && continue
-              CAMERA_VISIBLE_TERMS+=("${LAYOUT_EXPR[$i]}")
-            done
-            if [[ "${#CAMERA_VISIBLE_TERMS[@]}" -eq 0 ]]; then
-              CAMERA_VISIBLE_SUM_EXPR="0"
-            else
-              CAMERA_VISIBLE_SUM_EXPR=$(IFS='+'; echo "${CAMERA_VISIBLE_TERMS[*]}")
-            fi
-            log "session $cluster_num camera-visible-now expression: $CAMERA_VISIBLE_SUM_EXPR"
-
-            unset VLABEL_FULL VLABEL_TILE VLABEL_NARROW VLABEL_WIDE VLABEL_HOLD IS_FS_SOURCE TILE_X TILE_Y
-            declare -A VLABEL_FULL VLABEL_TILE VLABEL_NARROW VLABEL_WIDE VLABEL_HOLD IS_FS_SOURCE TILE_X TILE_Y
-            TILE_COUNTER=0
-            for i in "${!C_LOCAL_FILES[@]}"; do
-              type_v="${C_TYPES[$i]}"
-              source_v="${C_SOURCES[$i]}"
-              [[ "$type_v" == "VIDEO" ]] || continue
-
-              offset="${OFFSETS[$i]}"
-              stretch="${STRETCH[$i]}"
-              FFMPEG_INPUTS+=(-itsoffset "$offset" -i "${C_LOCAL_FILES[$i]}")
-
-              if [[ "$source_v" == "SCREEN_SHARE" || "$source_v" == "WHITEBOARD" ]]; then
-                # Two differently-scaled copies of the same source, same
-                # technique as the camera full/tile split below: a narrow
-                # one (960x720) for instants when a camera is genuinely
-                # visible and needs its column left clear, and a wide one
-                # (1280x720, the full canvas) for instants when it isn't.
-                # Pass 2 below picks whichever one actually applies at each
-                # moment via CAMERA_VISIBLE_SUM_EXPR - this only prepares
-                # both; it doesn't decide between them.
-                FILTER_PARTS+=("[${INPUT_IDX}:v]split=3[fs${INPUT_IDX}narrow][fs${INPUT_IDX}wide][fs${INPUT_IDX}hold]")
-                FILTER_PARTS+=("[fs${INPUT_IDX}narrow]scale=${TILE_COL_X}:720:force_original_aspect_ratio=decrease,pad=${TILE_COL_X}:720:(ow-iw)/2:(oh-ih)/2,setpts=(PTS-STARTPTS)*${stretch}+${offset}/TB[v${INPUT_IDX}n]")
-                FILTER_PARTS+=("[fs${INPUT_IDX}wide]scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2,setpts=(PTS-STARTPTS)*${stretch}+${offset}/TB[v${INPUT_IDX}w]")
-                # A third copy, held on its own last frame for the gap that
-                # follows this source (see HOLD_DUR pre-pass above) instead
-                # of letting the composite fall through to blank navy.
-                # tpad's stop_duration is measured on THIS stream's own
-                # pre-setpts timeline, but setpts below multiplies every PTS
-                # (including the padded tail) by $stretch - so the padding
-                # has to be pre-divided by $stretch here for the tail to
-                # actually last HOLD_DUR seconds once setpts has run.
-                hold_dur_raw="${HOLD_DUR[$i]:-0}"
-                hold_pad=$(echo "scale=6; $hold_dur_raw / $stretch" | bc)
-                (( $(echo "$hold_pad < 0" | bc -l) )) && hold_pad=0
-                # tpad's stop_duration is a duration-typed ffmpeg option -
-                # see fix_duration_leading_zero above.
-                hold_pad=$(fix_duration_leading_zero "$hold_pad")
-                FILTER_PARTS+=("[fs${INPUT_IDX}hold]scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2,tpad=stop_mode=clone:stop_duration=${hold_pad},setpts=(PTS-STARTPTS)*${stretch}+${offset}/TB[v${INPUT_IDX}h]")
-                VLABEL_NARROW[$i]="v${INPUT_IDX}n"
-                VLABEL_WIDE[$i]="v${INPUT_IDX}w"
-                VLABEL_HOLD[$i]="v${INPUT_IDX}h"
-                IS_FS_SOURCE[$i]=1
-              else
-                # Not a designated full-frame source (camera, or anything
-                # else that lands here): goes full-frame whenever it's
-                # active and nothing else is claiming the full frame at
-                # that moment, and shrinks to a small tile in the right-hand
-                # column only during the sub-window(s) where it overlaps a
-                # genuine full-frame source (screen share / whiteboard).
-                # ffmpeg can't resize one overlay dynamically, so this needs
-                # two differently-scaled copies of the same input, each
-                # gated by the opposite half of that condition. Tiles stack
-                # top-to-bottom (not left-to-right) so they stay inside the
-                # dedicated column and never drift left into the content
-                # box. tile_row comes from a dedicated counter over
-                # camera-like tracks only - not the raw track index i, which
-                # mixes in audio tracks and would scatter/mis-position tiles
-                # as soon as track ordering shifted (e.g. an extra mic track
-                # before a camera). Capped at 4 stacked tiles (fits exactly
-                # within 720px tall at this tile_h/margin); a 5th
-                # simultaneous camera would wrap and overlap a lower tile -
-                # no room realistically expected here has more than 4
-                # cameras on at once.
-                tile_margin=8
-                tile_h=$(( (720 - 5 * tile_margin) / 4 ))
-                tile_w=$(( TILE_COL_W - 10 ))
-                tile_row=$(( TILE_COUNTER % 4 ))
-                TILE_COUNTER=$((TILE_COUNTER + 1))
-                VLABEL_FULL[$i]="v${INPUT_IDX}f"
-                VLABEL_TILE[$i]="v${INPUT_IDX}t"
-                TILE_X[$i]="${TILE_COL_X}+5"
-                TILE_Y[$i]="${tile_margin}+((${tile_row})*(${tile_h}+${tile_margin}))"
-                IS_FS_SOURCE[$i]=0
-                FILTER_PARTS+=("[${INPUT_IDX}:v]split=2[cam${INPUT_IDX}tile][cam${INPUT_IDX}full]")
-                FILTER_PARTS+=("[cam${INPUT_IDX}tile]scale=${tile_w}:${tile_h}:force_original_aspect_ratio=decrease,setpts=(PTS-STARTPTS)*${stretch}+${offset}/TB[v${INPUT_IDX}t]")
-                FILTER_PARTS+=("[cam${INPUT_IDX}full]scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2,setpts=(PTS-STARTPTS)*${stretch}+${offset}/TB[v${INPUT_IDX}f]")
-              fi
-              INPUT_IDX=$((INPUT_IDX + 1))
-            done
-
-            # Pass 2: composite in the order that actually keeps things
-            # visible - the frozen full-frame HOLD tails first (lowest
-            # layer of all: pure fallback for when nothing else has
-            # anything to show), then camera full-frame views (mutually
-            # exclusive in time with the full-frame sources below by
-            # construction, so draw order between them never matters, and
-            # gated to skip whenever a hold is also eligible so a live
-            # camera always wins over a frozen slate), then the full-frame
-            # sources themselves, then camera corner TILES last/on top so
-            # they're never painted over.
-            for i in "${!C_LOCAL_FILES[@]}"; do
-              [[ "${C_TYPES[$i]}" == "VIDEO" && "${IS_FS_SOURCE[$i]:-}" == "1" ]] || continue
-              hold_dur="${HOLD_DUR[$i]:-0}"
-              (( $(echo "$hold_dur <= 0" | bc -l) )) && continue
-              hold_start=$(echo "${OFFSETS[$i]} + ${STRETCHED_DURATIONS[$i]}" | bc)
-              hold_end="${HOLD_END[$i]:-$hold_start}"
-              FILTER_PARTS+=("[${CUR_LABEL}][${VLABEL_HOLD[$i]}]overlay=enable='between(t,${hold_start},${hold_end})*lte(${CAMERA_VISIBLE_SUM_EXPR},0)'[ovh${i}]")
-              CUR_LABEL="ovh${i}"
-            done
-            for i in "${!C_LOCAL_FILES[@]}"; do
-              [[ "${C_TYPES[$i]}" == "VIDEO" && "${IS_FS_SOURCE[$i]:-}" == "0" ]] || continue
-              FILTER_PARTS+=("[${CUR_LABEL}][${VLABEL_FULL[$i]}]overlay=enable='${ACTIVE_EXPR[$i]}*lte(${FS_SUM_EXPR},0)'[ovf${i}]")
-              CUR_LABEL="ovf${i}"
-            done
-            for i in "${!C_LOCAL_FILES[@]}"; do
-              [[ "${C_TYPES[$i]}" == "VIDEO" && "${IS_FS_SOURCE[$i]:-}" == "1" ]] || continue
-              offset="${OFFSETS[$i]}"
-              end=$(echo "$offset + ${STRETCHED_DURATIONS[$i]}" | bc)
-              # Mutually exclusive by construction (gt/lte on the same
-              # expression), so draw order between narrow and wide never
-              # matters - and neither can ever coincide with this track's
-              # own camera tile below, since any camera tile being active
-              # necessarily makes CAMERA_VISIBLE_SUM_EXPR > 0 too.
-              FILTER_PARTS+=("[${CUR_LABEL}][${VLABEL_NARROW[$i]}]overlay=enable='between(t,${offset},${end})*gt(${CAMERA_VISIBLE_SUM_EXPR},0)'[ovsn${i}]")
-              CUR_LABEL="ovsn${i}"
-              FILTER_PARTS+=("[${CUR_LABEL}][${VLABEL_WIDE[$i]}]overlay=enable='between(t,${offset},${end})*lte(${CAMERA_VISIBLE_SUM_EXPR},0)'[ovsw${i}]")
-              CUR_LABEL="ovsw${i}"
-            done
-            for i in "${!C_LOCAL_FILES[@]}"; do
-              [[ "${C_TYPES[$i]}" == "VIDEO" && "${IS_FS_SOURCE[$i]:-}" == "0" ]] || continue
-              FILTER_PARTS+=("[${CUR_LABEL}][${VLABEL_TILE[$i]}]overlay=x='${TILE_X[$i]}':y='${TILE_Y[$i]}':enable='${ACTIVE_EXPR[$i]}*gt(${FS_SUM_EXPR},0)'[ovt${i}]")
-              CUR_LABEL="ovt${i}"
-            done
-            FINAL_VIDEO_LABEL="$CUR_LABEL"
-
-            # FIX: "ffmpeg failed (exit 234)" / "Output with label '0:v' does
-            # not exist in any defined filter graph". CUR_LABEL starts out as
-            # "0:v" - the raw background input - and only becomes a real
-            # filter-graph label (ovf1, ovsn1, ...) once at least one video
-            # overlay has been chained onto it. A session with NO camera and
-            # NO screen-share/whiteboard track (e.g. audio-only: just a
-            # microphone track) never adds an overlay, so CUR_LABEL is still
-            # the bare stream "0:v" - and `-map "[0:v]"` (square brackets =
-            # "a filter-graph output label") points at a label that doesn't
-            # exist, aborting the whole run. Passing the background through
-            # a no-op filter gives it a real label to map, so an audio-only
-            # session produces a normal MP4 (branded background + audio).
-            if [[ "$FINAL_VIDEO_LABEL" == "0:v" ]]; then
-              FILTER_PARTS+=("[0:v]null[bgonly]")
-              FINAL_VIDEO_LABEL="bgonly"
-            fi
+          # ---- Video: header + content box + participant tiles (see orbit_layout.py below) ----
+          # Replaces the old full-frame/corner-tile compositing. One fixed layout the whole time:
+          # header (group, date, speaker badge). Nothing shared: the speaker's camera (or the logo on
+          # white) fills the big area with all tiles on the right. Screen/whiteboard shared: tiles of
+          # people with a camera on in a right column, or no tiles and a full-width share if none.
+          MANIFEST="${WORKDIR}/manifest_${cluster_num}.tsv"
+          : > "$MANIFEST"
+          for i in "${!C_LOCAL_FILES[@]}"; do
+            printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "${C_KEYS[$i]}" "${C_LOCAL_FILES[$i]}" "${C_SOURCES[$i]}" "${C_TYPES[$i]}" "${OFFSETS[$i]}" "${STRETCHED_DURATIONS[$i]}" "${DURATIONS[$i]}" >> "$MANIFEST"
+          done
+          LAYOUT_JSON="${WORKDIR}/layout_${cluster_num}.json"
+          if ! python3 "${WORKDIR}/orbit_layout.py" "$MANIFEST" "$WORKDIR" "$TOTAL_DURATION" "$INPUT_IDX" "$cluster_num" "${GROUP_NAME:-}" "${SCHEDULED_TIME:-}" "$EARLIEST_START" > "$LAYOUT_JSON"; then
+            fail "session $cluster_num: could not build the recording layout (orbit_layout.py failed - see messages above)."
+          fi
+          BASE_LIST=$(jq -r '.base_list' "$LAYOUT_JSON")
+          FFMPEG_INPUTS+=(-f concat -safe 0 -i "$BASE_LIST")
+          mapfile -t LAYOUT_INPUTS < <(jq -r '.inputs[]' "$LAYOUT_JSON")
+          FFMPEG_INPUTS+=("${LAYOUT_INPUTS[@]}")
+          mapfile -t LAYOUT_PARTS < <(jq -r '.filter_parts[]' "$LAYOUT_JSON")
+          FILTER_PARTS+=("${LAYOUT_PARTS[@]}")
+          FINAL_VIDEO_LABEL=$(jq -r '.final_label' "$LAYOUT_JSON")
+          INPUT_IDX=$(jq -r '.next_idx' "$LAYOUT_JSON")
 
             AUDIO_INPUT_LABELS=()
             for i in "${!C_LOCAL_FILES[@]}"; do

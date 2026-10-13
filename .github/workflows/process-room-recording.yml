@@ -1361,7 +1361,10 @@ jobs:
             # FILTER_COMPLEX always has at least the apad stage above now
             # (it is never empty), so there's always a real filter graph to
             # run - no more empty-filter fallback path needed.
-            ffmpeg -y -hide_banner -loglevel warning -nostdin -filter_complex_threads 1 \
+            # diagnostics: log memory/CPU every 10s so a runner kill can be explained
+            ( while true; do sleep 10; echo "[mon] $(free -m | awk '/Mem/{print "mem_used="$3"MB avail="$7"MB"}') load=$(cut -d' ' -f1 /proc/loadavg) ffmpeg_rss=$(ps -C ffmpeg -o rss= | awk '{s+=$1} END{print int(s/1024)"MB"}')"; done ) &
+            MON_PID=$!
+            ffmpeg -y -hide_banner -loglevel warning -nostdin -stats -stats_period 10 -filter_complex_threads 1 \
               "${FFMPEG_INPUTS[@]}" \
               -filter_complex "$FILTER_COMPLEX" \
               -map "[${FINAL_VIDEO_LABEL}]" -map "$AUDIO_MAP_ARG" \
@@ -1371,6 +1374,7 @@ jobs:
               "$OUT_MP4" </dev/null
 
             FFMPEG_STATUS=$?
+            kill $MON_PID 2>/dev/null
             if [[ $FFMPEG_STATUS -ne 0 || ! -s "$OUT_MP4" ]]; then
               fail "session $cluster_num: ffmpeg failed (exit $FFMPEG_STATUS) or produced an empty file - nothing deleted from R2, and no marker was advanced past any earlier session in this run."
             fi

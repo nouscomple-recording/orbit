@@ -107,7 +107,7 @@ jobs:
           # ---- Logo + layout script ----
           # The logo is used for the white start screen and the tile avatars. If it can't be
           # downloaded the layout falls back to the text NOUS - never worth failing a recording.
-          curl -sSf --max-time 20 -o "${WORKDIR}/logo.png" "https://meet.nouscomplex.com/assets/nouscomplex.png" || { rm -f "${WORKDIR}/logo.png"; log "WARNING: could not download logo - using text fallback"; }
+          curl -sSf --max-time 20 -o "${WORKDIR}/logo.png" "https://orbit.nouscomplex.com/nouscomplex.png" || curl -sSf --max-time 20 -o "${WORKDIR}/logo.png" "https://meet.nouscomplex.com/assets/nouscomplex.png" || { rm -f "${WORKDIR}/logo.png"; log "WARNING: could not download logo - using text fallback"; }
           cat > "${WORKDIR}/orbit_layout.py" <<'ORBIT_LAYOUT_PY'
           #!/usr/bin/env python3
           # Orbit recording layout: header (group + date + speaker), content box on the left (shared screen /
@@ -1391,11 +1391,11 @@ jobs:
             # diagnostics: log memory/CPU every 10s so a runner kill can be explained
             ( while true; do sleep 10; echo "[mon] $(free -m | awk '/Mem/{print "mem_used="$3"MB avail="$7"MB"}') load=$(cut -d' ' -f1 /proc/loadavg) ffmpeg_rss=$(ps -C ffmpeg -o rss= | awk '{s+=$1} END{print int(s/1024)"MB"}')"; done ) &
             MON_PID=$!
-            ffmpeg -y -hide_banner -loglevel warning -nostdin -stats -stats_period 10 -filter_complex_threads 1 \
+            ffmpeg -y -hide_banner -loglevel warning -nostdin -stats -stats_period 10 \
               "${FFMPEG_INPUTS[@]}" \
               -filter_complex "$FILTER_COMPLEX" \
               -map "[${FINAL_VIDEO_LABEL}]" -map "$AUDIO_MAP_ARG" \
-              -c:v libx264 -preset ultrafast -crf 24 -threads 2 -pix_fmt yuv420p \
+              -c:v libx264 -preset fast -crf 20 -pix_fmt yuv420p \
               -c:a aac -b:a 160k \
               -t "$TOTAL_DURATION" -movflags +faststart \
               "$OUT_MP4" </dev/null

@@ -925,6 +925,193 @@ jobs:
             exit 0
           fi
 
+          # ---- Whiteboard: turn the saved drawing events into video ----
+          # The host's browser sends the board's drawing events to the server while the board is
+          # open (nothing is recorded as video on the host's device or the server). Here they are
+          # replayed in a headless browser into one video per "board open" period, and added to the
+          # track lists as WHITEBOARD tracks, exactly like a shared screen. Once every session below
+          # is registered, the saved events are deleted from the database.
+          BOARD_SID="${ROOM_ID#olive-}"
+          BOARD_REPLAY_OK=false
+          BOARD_HAS_VIDEO=false
+          for s_ in "${SOURCES[@]}"; do [[ "$s_" == "WHITEBOARD" ]] && BOARD_HAS_VIDEO=true; done
+          if [[ "$BOARD_HAS_VIDEO" == "true" ]]; then
+            log "whiteboard: a recorded board video already exists for this room - not replaying events"
+          else
+            BOARD_JSON="${WORKDIR}/board_events.json"
+            BOARD_HTTP=$(curl -sS -o "$BOARD_JSON" -w '%{http_code}' -X POST "${SUPABASE_URL}/functions/v1/board-events" \
+              -H "Content-Type: application/json" -H "x-hook-secret: ${RECORDER_HOOK_SECRET}" \
+              -d "$(jq -n --arg s "$BOARD_SID" '{action:"get", schedule_id:$s}')" || echo 000)
+            if [[ "$BOARD_HTTP" == "200" ]] && jq -e '.ok == true' "$BOARD_JSON" >/dev/null 2>&1; then
+              BOARD_COUNT=$(jq '.events | length' "$BOARD_JSON")
+              log "whiteboard: fetched ${BOARD_COUNT} saved drawing event(s)"
+              if [[ "$BOARD_COUNT" -eq 0 ]]; then
+                BOARD_REPLAY_OK=true
+              else
+                BOARD_MIN=$(printf '%s\n' "${STARTS[@]}" | awk '$1>0' | sort -g | head -1)
+                BOARD_MAX=$(printf '%s\n' "${ENDS[@]}" | sort -g | tail -1)
+                PWDIR="${WORKDIR}/pw"; mkdir -p "$PWDIR"
+                cat > "${PWDIR}/board_replay.mjs" <<'BOARD_REPLAY_EOF'
+          // Replays whiteboard events (saved by the live class page) into one mp4 per "board open" period.
+          //   node board_replay.mjs <events.json> <outdir> [earliestTrackStartEpochSec] [latestTrackEndEpochSec]
+          // Writes <outdir>/board_N.mp4 and <outdir>/board_tracks.json  [{file,start,end}]  (epoch seconds)
+          import fs from 'node:fs';
+          import path from 'node:path';
+          import { spawnSync } from 'node:child_process';
+          import { createRequire } from 'node:module';
+
+          const [evFile, outDir, minStartArg, maxEndArg] = process.argv.slice(2);
+          if (!evFile || !outDir) { console.error('usage: board_replay.mjs events.json outdir [minStart maxEnd]'); process.exit(2); }
+          const W = 1280, H = 720, GRID = 100, FADE = 900;
+
+          let chromium;
+          try { ({ chromium } = createRequire(import.meta.url)('playwright')); }
+          catch { ({ chromium } = await import(process.env.PLAYWRIGHT_ENTRY || 'playwright')); }
+
+          const raw = JSON.parse(fs.readFileSync(evFile, 'utf8'));
+          const events = (Array.isArray(raw) ? raw : raw.events || []).filter(e => e && typeof e.a === 'number' && isFinite(e.a))
+            .map((e, i) => [e, i]).sort((x, y) => x[0].a - y[0].a || x[1] - y[1]).map(x => x[0]);
+          fs.mkdirSync(outDir, { recursive: true });
+          if (!events.length) { fs.writeFileSync(path.join(outDir, 'board_tracks.json'), '[]'); console.log('no board events'); process.exit(0); }
+
+          const PAGE = `<!doctype html><meta charset="utf-8"><body style="margin:0"><canvas id="c" width="${W}" height="${H}"></canvas><script>
+          const W=${W},H=${H},FADE=${FADE};
+          const TYPES=['pen','line','arrow','rect','ellipse','diamond','text'];
+          const num=v=>(typeof v==='number'&&isFinite(v))?v:0;
+          const color=c=>(typeof c==='string'&&/^#[0-9a-f]{3,8}$/i.test(c))?c:'#0b1647';
+          function clean(o){
+            if(!o||!TYPES.includes(o.ty)||typeof o.id!=='string'||o.id.length>40) return null;
+            const r={id:o.id,ty:o.ty,c:color(o.c),w:Math.min(40,Math.max(1,num(o.w)||4)),f:!!o.f,ox:num(o.ox),oy:num(o.oy),by:String(o.by||'').slice(0,60)};
+            if(o.ty==='pen') r.p=(Array.isArray(o.p)?o.p:[]).slice(0,8000).map(num);
+            else if(o.ty==='text'){r.x=num(o.x);r.y=num(o.y);r.s=String(o.s||'').slice(0,500);r.sz=Math.min(300,Math.max(10,num(o.sz)||28));}
+            else{r.x=num(o.x);r.y=num(o.y);r.x2=num(o.x2);r.y2=num(o.y2);}
+            return r;
+          }
+          let objs=[],map=new Map(),open=false,view={x:0,y:0,k:1,w:W,h:H},lasers=new Map();
+          const add=o=>{if(map.has(o.id))return false;objs.push(o);map.set(o.id,o);return true;};
+          const del=id=>{const o=map.get(id);if(!o)return;map.delete(id);objs.splice(objs.indexOf(o),1);};
+          function apply(ev){
+            if(ev.s){const s=ev.s;if(s.r){objs=[];map.clear();open=!!s.open;}for(const r of (s.o||[])){const c=clean(r);if(c)add(c);}return;}
+            if(ev.v){view=ev.v;return;}
+            const o=ev.o;if(!o)return;const p=String(ev.p||''),host=!!ev.h,may=t=>host||!t||t.by===p;
+            if(o.t==='open'){open=!!o.v;return;}
+            if(o.t==='clear'){objs=[];map.clear();return;}
+            if(o.t==='add'){const c=clean(o.o);if(c){c.by=p;add(c);open=true;}return;}
+            if(o.t==='tx'){const id=String(o.id||''),ex=map.get(id);
+              if(!String(o.s||'').trim()){if(ex&&ex.by===p)del(id);return;}
+              if(ex){if(ex.by===p&&ex.ty==='text'){const c=clean({id,ty:'text',c:o.c,w:3,x:o.x,y:o.y,s:o.s,sz:o.sz,by:p});if(c){ex.s=c.s;ex.x=c.x;ex.y=c.y;ex.sz=c.sz;ex.c=c.c;}}return;}
+              const c=clean({id,ty:'text',c:o.c,w:3,x:o.x,y:o.y,s:o.s,sz:o.sz,by:p});if(c){c.by=p;add(c);open=true;}return;}
+            if(o.t==='sh'){const c=clean(o.o);if(c&&c.ty!=='pen'&&c.ty!=='text'){c.by=p;const ex=map.get(c.id);if(!ex){add(c);open=true;}else if(ex.by===p){ex.x=c.x;ex.y=c.y;ex.x2=c.x2;ex.y2=c.y2;}}return;}
+            if(o.t==='pp'){const t=map.get(o.id);if(t&&t.ty==='pen'&&may(t)&&Array.isArray(o.p)&&t.p.length<8000)t.p.push(...o.p.slice(0,400).map(num));return;}
+            if(o.t==='rs'){const t=map.get(o.id);if(t&&t.ty==='text'&&may(t))t.sz=Math.min(300,Math.max(10,num(o.sz)||t.sz));return;}
+            if(o.t==='mv'){const t=map.get(o.id);if(t&&may(t)){t.ox=num(o.ox);t.oy=num(o.oy);}return;}
+            if(o.t==='del'){for(const id of (Array.isArray(o.ids)?o.ids.slice(0,200):[])){const t=map.get(id);if(t&&may(t))del(id);}return;}
+            if(o.t==='laser'){let L=lasers.get(p);if(!L){L={pts:[]};lasers.set(p,L);}L.pts.push({x:num(o.x),y:num(o.y),t:ev.a});if(L.pts.length>60)L.pts.shift();}
+          }
+          function path(g,o){
+            g.beginPath();
+            if(o.ty==='pen'){if(o.p.length>=2){g.moveTo(o.p[0],o.p[1]);if(o.p.length===2)g.lineTo(o.p[0]+0.01,o.p[1]);for(let i=2;i+1<o.p.length;i+=2)g.lineTo(o.p[i],o.p[i+1]);}return;}
+            if(o.ty==='line'||o.ty==='arrow'){g.moveTo(o.x,o.y);g.lineTo(o.x2,o.y2);
+              if(o.ty==='arrow'){const a=Math.atan2(o.y2-o.y,o.x2-o.x),h=10+o.w*2;g.moveTo(o.x2,o.y2);g.lineTo(o.x2-h*Math.cos(a-0.45),o.y2-h*Math.sin(a-0.45));g.moveTo(o.x2,o.y2);g.lineTo(o.x2-h*Math.cos(a+0.45),o.y2-h*Math.sin(a+0.45));}return;}
+            if(o.ty==='rect')g.rect(Math.min(o.x,o.x2),Math.min(o.y,o.y2),Math.abs(o.x2-o.x),Math.abs(o.y2-o.y));
+            if(o.ty==='ellipse')g.ellipse((o.x+o.x2)/2,(o.y+o.y2)/2,Math.abs(o.x2-o.x)/2,Math.abs(o.y2-o.y)/2,0,0,7);
+            if(o.ty==='diamond'){const cx=(o.x+o.x2)/2,cy=(o.y+o.y2)/2;g.moveTo(cx,o.y);g.lineTo(o.x2,cy);g.lineTo(cx,o.y2);g.lineTo(o.x,cy);g.closePath();}
+          }
+          function draw(g,o){
+            g.save();g.translate(o.ox,o.oy);g.strokeStyle=o.c;g.fillStyle=o.c;g.lineWidth=o.w;g.lineCap='round';g.lineJoin='round';
+            if(o.ty==='text'){g.font=o.sz+'px system-ui,sans-serif';g.textBaseline='alphabetic';o.s.split('\\n').forEach((l,i)=>g.fillText(l,o.x,o.y+i*o.sz*1.25));}
+            else{path(g,o);if(o.f&&['rect','ellipse','diamond'].includes(o.ty)){g.globalAlpha=0.25;g.fill();g.globalAlpha=1;}g.stroke();}
+            g.restore();
+          }
+          const cv=document.getElementById('c'),g=cv.getContext('2d');
+          function lasersAlive(t){for(const L of lasers.values())if(L.pts.some(p=>t-p.t<FADE))return true;return false;}
+          function render(t){
+            const v=view,vw=v.w||W,vh=v.h||H,s=Math.min(W/vw,H/vh),ox=(W-vw*s)/2,oy=(H-vh*s)/2;
+            g.setTransform(1,0,0,1,0,0);g.fillStyle='#fff';g.fillRect(0,0,W,H);
+            g.save();g.beginPath();g.rect(ox,oy,vw*s,vh*s);g.clip();
+            g.setTransform(s*v.k,0,0,s*v.k,ox+s*v.x,oy+s*v.y);
+            for(const o of objs)draw(g,o);
+            for(const [k,L] of lasers){
+              L.pts=L.pts.filter(p=>t-p.t<FADE);if(!L.pts.length){lasers.delete(k);continue;}
+              for(let i=1;i<L.pts.length;i++){const a=L.pts[i-1],b=L.pts[i],al=Math.max(0,1-(t-b.t)/FADE);g.strokeStyle='rgba(255,60,80,'+al+')';g.lineWidth=5/v.k;g.lineCap='round';g.beginPath();g.moveTo(a.x,a.y);g.lineTo(b.x,b.y);g.stroke();}
+              const e=L.pts[L.pts.length-1];g.fillStyle='rgba(255,60,80,.95)';g.beginPath();g.arc(e.x,e.y,7/v.k,0,7);g.fill();
+            }
+            g.restore();
+          }
+          window.runAll=async function(events,minStart,maxEnd){
+            const out=[];let cur=null,i=0,n=0;
+            const t0=Math.floor(events[0].a/${GRID})*${GRID};
+            const last=events[events.length-1].a;
+            const tEnd=Math.min(maxEnd>0?maxEnd:Infinity,last+30000);
+            let dirty=false;
+            for(let t=t0;t<=tEnd+${GRID};t+=${GRID}){
+              while(i<events.length&&events[i].a<=t){apply(events[i]);i++;dirty=true;}
+              if(t>tEnd){ if(cur&&open){} break; }
+              if(open&&!cur&&t>=minStart){cur={start:t,frames:[]};dirty=true;}
+              if(!open&&cur){cur.end=t;out.push(cur);cur=null;lasers.clear();continue;}
+              if(cur){
+                const alive=lasersAlive(t);
+                if(dirty||alive||!cur.frames.length){render(t);const url=cv.toDataURL('image/png');const name='f'+(n++)+'.png';await window.saveFrame(name,url);cur.frames.push({file:name,t});dirty=alive;}
+              }
+            }
+            if(cur){cur.end=Math.min(tEnd,Math.max(cur.start+1000,last+30000));out.push(cur);}
+            return out;
+          };
+          </script>`;
+
+          const browser = await chromium.launch({ executablePath: process.env.CHROME_PATH || undefined, args: ['--no-sandbox'] });
+          const page = await browser.newPage({ viewport: { width: W, height: H } });
+          const fdir = fs.mkdtempSync(path.join(outDir, 'frames_'));
+          await page.exposeFunction('saveFrame', (name, url) => { fs.writeFileSync(path.join(fdir, name), Buffer.from(url.split(',')[1], 'base64')); });
+          await page.setContent(PAGE);
+          const minStartMs = minStartArg ? Number(minStartArg) * 1000 : 0, maxEndMs = maxEndArg ? Number(maxEndArg) * 1000 : 0;
+          const periods = await page.evaluate(([ev, a, b]) => window.runAll(ev, a, b), [events, minStartMs, maxEndMs]);
+          await browser.close();
+
+          const tracks = [];
+          let idx = 0;
+          for (const pd of periods) {
+            if (!pd.frames.length || pd.end - pd.start < 1000) continue;
+            idx++;
+            const list = path.join(fdir, `list_${idx}.txt`);
+            const lines = ['ffconcat version 1.0'];
+            pd.frames.forEach((f, k) => { const next = k + 1 < pd.frames.length ? pd.frames[k + 1].t : pd.end; lines.push(`file '${f.file}'`, `duration ${((next - f.t) / 1000).toFixed(3)}`); });
+            lines.push(`file '${pd.frames[pd.frames.length - 1].file}'`);
+            fs.writeFileSync(list, lines.join('\n') + '\n');
+            const outFile = path.join(outDir, `board_${idx}.mp4`);
+            const r = spawnSync('ffmpeg', ['-y', '-loglevel', 'error', '-f', 'concat', '-safe', '0', '-i', list, '-vf', 'fps=30,format=yuv420p', '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '20', '-g', '60', '-an', outFile], { stdio: 'inherit' });
+            if (r.status !== 0) { console.error('ffmpeg failed for period', idx); process.exit(1); }
+            tracks.push({ file: outFile, start: pd.start / 1000, end: pd.end / 1000 });
+          }
+          fs.rmSync(fdir, { recursive: true, force: true });
+          fs.writeFileSync(path.join(outDir, 'board_tracks.json'), JSON.stringify(tracks));
+          console.log(`board replay: ${events.length} events -> ${tracks.length} video(s)`);
+          BOARD_REPLAY_EOF
+                if ( cd "$PWDIR" && npm init -y >/dev/null 2>&1 && npm install playwright@1.49.1 >/dev/null 2>&1 \
+                     && npx playwright install --with-deps chromium >/dev/null 2>&1 ) \
+                   && ( cd "$PWDIR" && node board_replay.mjs "$BOARD_JSON" "${PWDIR}/out" "${BOARD_MIN:-0}" "${BOARD_MAX:-0}" ) </dev/null; then
+                  BOARD_N=0
+                  while IFS=$'\t' read -r b_file b_start b_end; do
+                    [[ -s "$b_file" ]] || continue
+                    BOARD_N=$((BOARD_N + 1))
+                    RAW_KEYS+=("board-events/orbit-board-${BOARD_SID}__WHITEBOARD__VIDEO__${BOARD_N}.mp4")
+                    LOCAL_FILES+=("$b_file")
+                    SOURCES+=("WHITEBOARD")
+                    TYPES+=("VIDEO")
+                    STARTS+=("$b_start")
+                    ENDS+=("$b_end")
+                    log "whiteboard: added board video ${BOARD_N} (${b_start} -> ${b_end})"
+                  done < <(jq -r '.[] | [.file, .start, .end] | @tsv' "${PWDIR}/out/board_tracks.json")
+                  BOARD_REPLAY_OK=true
+                else
+                  log "WARNING: whiteboard replay failed - the recording continues without the board video, and the saved events are kept (they are removed automatically after 3 days)"
+                fi
+              fi
+            else
+              log "WARNING: could not fetch whiteboard events (HTTP ${BOARD_HTTP}) - recording continues without the board video"
+            fi
+          fi
+
           # ---- Split the surviving items back into distinct sessions ----
           # LiveKit's ListEgress returns every egress job ever run for this
           # room NAME, and the marker above only stops us reprocessing
@@ -1498,12 +1685,21 @@ jobs:
           # session's compressed MP4 is uploaded and registered. Flip this
           # back to "true" if another round of debugging against real raw
           # tracks is needed.
+          # Every session is uploaded and registered: the saved whiteboard events are no longer needed.
+          if [[ "${BOARD_REPLAY_OK:-false}" == "true" ]]; then
+            BOARD_DEL=$(curl -sS -X POST "${SUPABASE_URL}/functions/v1/board-events" \
+              -H "Content-Type: application/json" -H "x-hook-secret: ${RECORDER_HOOK_SECRET}" \
+              -d "$(jq -n --arg s "$BOARD_SID" '{action:"delete", schedule_id:$s}')" || echo '{}')
+            log "whiteboard: deleted saved events: ${BOARD_DEL}"
+          fi
+
           KEEP_RAW_FILES_FOR_DEBUGGING=false
           if [[ "$KEEP_RAW_FILES_FOR_DEBUGGING" == "true" ]]; then
             log "cleaning up: SKIPPED (KEEP_RAW_FILES_FOR_DEBUGGING=true) - raw per-track files left in R2 for forensics: ${RAW_KEYS[*]}"
           else
             log "cleaning up: deleting raw per-track R2 objects..."
             for key in "${RAW_KEYS[@]}"; do
+              [[ "$key" == board-events/* ]] && continue
               rclone_ deletefile "${RCLONE_REMOTE}:${R2_BUCKET_NAME}/${key}" || true
             done
           fi

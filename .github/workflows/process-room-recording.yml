@@ -42,7 +42,7 @@ jobs:
     # cleanup job below by hand instead, so don't run this job then.
     if: github.event_name == 'repository_dispatch' || (github.event_name == 'workflow_dispatch' && github.event.inputs.room_id != '')
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 60
     env:
       ROOM_ID: ${{ github.event.client_payload.room_id || github.event.inputs.room_id }}
       R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
@@ -76,7 +76,15 @@ jobs:
       - name: Install ffmpeg, rclone, bc (jq/curl/openssl/python3 already on runner)
         run: |
           sudo apt-get update -y
-          sudo apt-get install -y ffmpeg bc python3-pil fonts-dejavu-core
+          # The default Azure Ubuntu mirror is sometimes extremely slow (one run took 25 minutes for 70 MB). If the install has not
+          # finished in 4 minutes, stop it and try again from the main Ubuntu archive instead of letting it eat the job's time.
+          PKGS="ffmpeg bc python3-pil fonts-dejavu-core"
+          if ! timeout 240 sudo apt-get install -y $PKGS; then
+            echo "::warning::apt install was slow or failed; retrying from archive.ubuntu.com"
+            sudo sed -i 's#azure.archive.ubuntu.com#archive.ubuntu.com#g' /etc/apt/apt-mirrors.txt /etc/apt/sources.list /etc/apt/sources.list.d/* 2>/dev/null || true
+            sudo apt-get update -y
+            sudo apt-get install -y $PKGS
+          fi
           curl https://rclone.org/install.sh | sudo bash
           python3 -c 'import PIL' || { echo '::error::missing python3-pil'; exit 1; }
           for bin in ffmpeg ffprobe rclone jq curl openssl python3 bc; do

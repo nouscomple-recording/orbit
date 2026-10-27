@@ -448,7 +448,18 @@ jobs:
               for p, x, y, ov in cells_for(key):
                   corner_mask(img, (x, y, COL_W, TILE_H), 10)
               d = ImageDraw.Draw(img)
-              d.text((16, 11), fit(d, GROUP, F_TITLE, 420), font=F_TITLE, fill=WHITE)
+              # Title: as wide as the header allows. The room to its right is the date plus the longest possible "Speaking" pill
+              # (400 px), a constant, so the title looks the same in every frame. A long name first shrinks a little and is only
+              # cut with "..." if it still does not fit at the smallest size.
+              date_w = d.textlength(DATE, font=F_DATE) + 20 if DATE else 0
+              title_max = max(420, int(W - 16 - date_w - 400 - 20 - 16))
+              title_font, title_text = F_TITLE, GROUP
+              for tsize in (20, 18, 16, 15):
+                  title_font = F_TITLE if tsize == 20 else font(tsize, True)
+                  if d.textlength(GROUP, font=title_font) <= title_max:
+                      break
+              title_text = fit(d, GROUP, title_font, title_max)
+              d.text((16, 11 + (20 - tsize) // 2), title_text, font=title_font, fill=WHITE)
               right = W - 16
               if DATE:
                   tw = d.textlength(DATE, font=F_DATE)

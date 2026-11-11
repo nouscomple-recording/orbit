@@ -990,6 +990,17 @@ jobs:
           const raw = JSON.parse(fs.readFileSync(evFile, 'utf8'));
           const events = (Array.isArray(raw) ? raw : raw.events || []).filter(e => e && typeof e.a === 'number' && isFinite(e.a))
             .map((e, i) => [e, i]).sort((x, y) => x[0].a - y[0].a || x[1] - y[1]).map(x => x[0]);
+          try { // diagnostic: per-stroke event trace in the log (which events built each pen stroke, and any long jumps between neighbouring points)
+            const tr = new Map(); let sn = 0;
+            for (const e of events) {
+              if (e.s) { sn++; for (const r of (e.s.o || [])) if (r && r.ty === 'pen') (tr.get(r.id) || tr.set(r.id, []).get(r.id)).push('S' + (e.s.r ? 'r' : '') + ':' + ((r.p || []).length / 2) + '@' + e.a); continue; }
+              const o = e.o; if (!o) continue;
+              if (o.t === 'add' && o.o && o.o.ty === 'pen') (tr.get(o.o.id) || tr.set(o.o.id, []).get(o.o.id)).push('add:' + ((o.o.p || []).length / 2) + '@' + e.a);
+              else if (o.t === 'pp') (tr.get(o.id) || tr.set(o.id, []).get(o.id)).push('pp:' + ((o.p || []).length / 2) + '@' + e.a);
+            }
+            let k = 0; for (const [id, list] of tr) { if (k++ >= 30) break; console.log('PENTRACE ' + id + ' ' + list.join(' ')); }
+            console.log('PENTRACE snapshots=' + sn + ' events=' + events.length);
+          } catch (e) { console.log('PENTRACE failed ' + e.message); }
           fs.mkdirSync(outDir, { recursive: true });
           if (!events.length) { fs.writeFileSync(path.join(outDir, 'board_tracks.json'), '[]'); console.log('no board events'); process.exit(0); }
 

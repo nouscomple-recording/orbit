@@ -1021,7 +1021,7 @@ jobs:
               if(ex){if(may(ex)&&ex.ty==='text'){const c=clean({id,ty:'text',c:o.c,w:3,x:o.x,y:o.y,s:o.s,sz:o.sz,by:ex.by});if(c){ex.s=c.s;ex.x=c.x;ex.y=c.y;ex.sz=c.sz;ex.c=c.c;}}return;}
               const c=clean({id,ty:'text',c:o.c,w:3,x:o.x,y:o.y,s:o.s,sz:o.sz,by:p});if(c){c.by=p;add(c);open=true;}return;}
             if(o.t==='sh'){const c=clean(o.o);if(c&&c.ty!=='pen'&&c.ty!=='text'){c.by=p;const ex=map.get(c.id);if(!ex){add(c);open=true;}else if(ex.by===p){ex.x=c.x;ex.y=c.y;ex.x2=c.x2;ex.y2=c.y2;}}return;}
-            if(o.t==='pp'){const t=map.get(o.id);if(t&&t.ty==='pen'&&may(t)&&Array.isArray(o.p)&&t.p.length<8000)t.p.push(...o.p.slice(0,400).map(num));return;}
+            if(o.t==='pp'){const t=map.get(o.id);if(t&&t.ty==='pen'&&may(t)&&Array.isArray(o.p)&&t.p.length<8000){const q=o.p.slice(0,400).map(num);let dup=false;for(let i=0;i+q.length<=t.p.length&&!dup;i+=2){let k=0;while(k<q.length&&t.p[i+k]===q[k])k++;if(k===q.length)dup=true;}if(!dup)t.p.push(...q);}return;}
             if(o.t==='rs'){const t=map.get(o.id);if(t&&t.ty==='text'&&may(t))t.sz=Math.min(300,Math.max(10,num(o.sz)||t.sz));return;}
             if(o.t==='mv'){const t=map.get(o.id);if(t&&may(t)){t.ox=num(o.ox);t.oy=num(o.oy);}return;}
             if(o.t==='del'){for(const id of (Array.isArray(o.ids)?o.ids.slice(0,200):[])){const t=map.get(id);if(t&&may(t))del(id);}return;}

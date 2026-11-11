@@ -735,9 +735,10 @@ jobs:
 
           ITEM_COUNT=$(echo "$FINAL_JSON" | jq '.items // [] | length')
           if [[ "$ITEM_COUNT" -eq 0 ]]; then
-            log "no egress jobs found for this room - nothing to process. Exiting cleanly."
-            rm -rf "$WORKDIR"
-            exit 0
+            # No mic, camera or screen-share track was ever recorded. The whiteboard alone can still
+            # make a recording, so carry on: the board events are checked below and the job only
+            # stops there if there is nothing at all to record.
+            log "no egress jobs found for this room - checking for whiteboard drawing before giving up"
           fi
           log "found $ITEM_COUNT egress job(s)"
 
@@ -940,8 +941,7 @@ jobs:
           done < "${WORKDIR}/items.ndjson"
 
           if [[ "${#LOCAL_FILES[@]}" -eq 0 ]]; then
-            log "no raw files could be downloaded - nothing to compress."
-            exit 0
+            log "no usable audio/video tracks - the whiteboard (if it was used) can still be recorded on its own"
           fi
 
           # ---- Whiteboard: turn the saved drawing events into video ----
@@ -1140,6 +1140,12 @@ jobs:
             else
               log "WARNING: could not fetch whiteboard events (HTTP ${BOARD_HTTP}) - recording continues without the board video"
             fi
+          fi
+
+          if [[ "${#LOCAL_FILES[@]}" -eq 0 ]]; then
+            log "nothing to record (no audio, video, screen share or whiteboard) - nothing to process. Exiting cleanly."
+            rm -rf "$WORKDIR"
+            exit 0
           fi
 
           # ---- Split the surviving items back into distinct sessions ----
